@@ -3,3 +3,4 @@ google-genai
 yfinance
 pandas
 schedule
+flask
