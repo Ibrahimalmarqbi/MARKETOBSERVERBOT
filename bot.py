@@ -1,154 +1,64 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 import threading
-import time
-from google import genai
-from google.genai import types
-import pandas as pd
-import schedule
+from flask import Flask
 import telebot
-import yfinance as yf
+from google import genai
 
-# --- خادم وهمي لإرضاء Render في الخطة المجانية ---
-class SimpleServer(BaseHTTPRequestHandler):
-
-  def do_GET(self):
-    self.send_response(200)
-    self.end_headers()
-    self.wfile.write(b"Bot is active!")
-
-  def do_HEAD(self):
-    self.send_response(200)
-    self.end_headers()
-
-
-def run_http_server():
-  port = int(os.environ.get("PORT", 8080))
-  server = HTTPServer(("0.0.0.0", port), SimpleServer)
-  server.serve_forever()
-
-
-# --- جلب البيانات الحساسة من متغيرات البيئة ---
+# 1. جلب المتغيرات من البيئة
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# 2. تهيئة البوت والذكاء الاصطناعي
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-client = genai.Client(api_key=GEMINI_API_KEY)
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-SYSTEM_PROMPT = """
-أنت خبير ومحلل مالي ومستشار أسواق عالمية (Forex، ذهب، بيتكوين).
-تتحدث بأسلوب احترافي، سلس، وشخصية خبير محترف ولطيف.
-"""
+# 3. خادم HTTP وهمي لإرضاء فحص Render
+app = Flask(__name__)
 
-FOREX_PAIRS = {
-    "EURUSD=X": "EUR/USD (يورو / دولار)",
-    "GBPUSD=X": "GBP/USD (باوند / دولار)",
-    "USDJPY=X": "USD/JPY (دولار / ين)",
-    "GC=F": "XAU/USD (الذهب)",
-    "BTC-USD": "BTC/USD (البيتكوين)",
-}
+@app.route('/')
+def home():
+    return "Bot is active!"
 
+def run_http_server():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
-def generate_ai_response(prompt):
-  available_models = [
-      "gemini-2.5-flash",
-      "gemini-2.0-flash",
-      "gemini-1.5-flash",
-  ]
-  for model_name in available_models:
+# 4. دالة الاستعلام من Gemini
+def generate_ai_response(prompt_text):
     try:
-      response = client.models.generate_content(
-          model=model_name,
-          contents=prompt,
-          config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-      )
-      return response.text
-    except Exception as e:
-      print(f"⚠️ GEMINI ERROR ({model_name}): {e}")
-      continue
-  return "عذراً، تعذر الاتصال بنماذج الذكاء الاصطناعي حالياً."
-
-
-def calculate_rsi(series, period=14):
-  delta = series.diff()
-  gain = (delta.where(delta > 0, 0)).fillna(0)
-  loss = (-delta.where(delta < 0, 0)).fillna(0)
-  avg_gain = gain.rolling(window=period).mean()
-  avg_loss = loss.rolling(window=period).mean()
-  rs = avg_gain / avg_loss
-  return 100 - (100 / (1 + rs))
-
-
-def fetch_market_data():
-  summary_data = []
-  for symbol, name in FOREX_PAIRS.items():
-    try:
-      ticker = yf.Ticker(symbol)
-      df = ticker.history(period="1mo", interval="1d", timeout=5)
-      if df is not None and len(df) >= 15:
-        df["RSI"] = calculate_rsi(df["Close"])
-        last_close = round(float(df["Close"].iloc[-1]), 4)
-        last_rsi = round(float(df["RSI"].iloc[-1]), 1)
-        summary_data.append(
-            f"• {name}: السعر الحالي {last_close} | مؤشر RSI: {last_rsi}"
+        response = ai_client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=prompt_text
         )
+        return response.text
     except Exception as e:
-      print(f"⚠️ FETCH ERROR ({symbol}): {e}")
-  return (
-      "\n".join(summary_data)
-      if summary_data
-      else "تعذر جلب البيانات اللحظية."
-  )
+        print(f"❌ GEMINI ERROR DETAILS: {e}")
+        return None
 
+# 5. معالجة الرسائل
+@bot.message_handler(func=lambda message: True)
+def handle_messages(message):
+    user_text = message.text
+    
+    # إرسال حالة "جاري الكتابة..."
+    bot.send_chat_action(message.chat.id, 'typing')
+    
+    reply = generate_ai_response(user_text)
+    
+    if reply:
+        bot.reply_to(message, reply)
+    else:
+        bot.reply_to(
+            message, 
+            "⚠️ تعذر الحصول على رد من Gemini. تحقق من صحة المفتاح GEMINI_API_KEY في Render Logs."
+        )
 
-def generate_expert_report():
-  raw_data = fetch_market_data()
-  prompt = f"بيانات السوق الحالية:\n{raw_data}\n\nاكتب تقرير تحليلي مالي شامل كخبير تداول بأسلوب جذاب."
-  return generate_ai_response(prompt)
-
-
-@bot.message_handler(commands=["start", "help"])
-def send_welcome(message):
-  res = generate_ai_response(
-      "رحب بالعميل كخبير مالي ووضح له الأمر /analyze."
-  )
-  bot.reply_to(message, res)
-
-
-@bot.message_handler(commands=["analyze"])
-def handle_analyze(message):
-  waiting_msg = bot.reply_to(message, "📈 جاري تحضير التقرير...")
-  try:
-    report = generate_expert_report()
-    bot.edit_message_text(
-        report, chat_id=message.chat.id, message_id=waiting_msg.message_id
-    )
-  except Exception as e:
-    print(f"⚠️ ANALYZE ERROR: {e}")
-    bot.send_message(message.chat.id, "حدث خطأ أثناء إعداد التقرير.")
-
-
-@bot.message_handler(func=lambda msg: True)
-def handle_chat(message):
-  res = generate_ai_response(
-      f"المستخدم يقول: '{message.text}'. رد عليه كخبير مالي."
-  )
-  bot.reply_to(message, res)
-
-
-def run_scheduler():
-  if CHAT_ID:
-    schedule.every(2).hours.do(
-        lambda: bot.send_message(CHAT_ID, generate_expert_report())
-    )
-    while True:
-      schedule.run_pending()
-      time.sleep(1)
-
-
+# 6. التشغيل الرئيسي
 if __name__ == "__main__":
-  threading.Thread(target=run_http_server, daemon=True).start()
-  threading.Thread(target=run_scheduler, daemon=True).start()
-  print("🚀 البوت يعمل بنجاح!")
-  bot.infinity_polling()
+    # تشغيل السيرفر في خلفية منفصلة
+    threading.Thread(target=run_http_server, daemon=True).start()
+    
+    print("🚀 تم تشغيل البوت بنجاح...")
+    
+    # skip_pending يمنع تضارب الرسائل القديمة ويقضي على خطأ 409
+    bot.infinity_polling(skip_pending=True)
