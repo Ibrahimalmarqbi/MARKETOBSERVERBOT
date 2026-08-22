@@ -8,6 +8,7 @@ import pandas as pd
 import schedule
 import telebot
 import yfinance as yf
+
 # --- خادم وهمي لإرضاء Render في الخطة المجانية ---
 class SimpleServer(BaseHTTPRequestHandler):
 
@@ -25,7 +26,6 @@ def run_http_server():
   port = int(os.environ.get("PORT", 8080))
   server = HTTPServer(("0.0.0.0", port), SimpleServer)
   server.serve_forever()
-
 
 
 # --- جلب البيانات الحساسة من متغيرات البيئة ---
@@ -51,7 +51,11 @@ FOREX_PAIRS = {
 
 
 def generate_ai_response(prompt):
-  available_models = ["gemini-2.0-flash", "gemini-1.5-flash"]
+  available_models = [
+      "gemini-2.5-flash",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash",
+  ]
   for model_name in available_models:
     try:
       response = client.models.generate_content(
@@ -60,7 +64,8 @@ def generate_ai_response(prompt):
           config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
       )
       return response.text
-    except Exception:
+    except Exception as e:
+      print(f"⚠️ GEMINI ERROR ({model_name}): {e}")
       continue
   return "عذراً، تعذر الاتصال بنماذج الذكاء الاصطناعي حالياً."
 
@@ -88,8 +93,8 @@ def fetch_market_data():
         summary_data.append(
             f"• {name}: السعر الحالي {last_close} | مؤشر RSI: {last_rsi}"
         )
-    except Exception:
-      pass
+    except Exception as e:
+      print(f"⚠️ FETCH ERROR ({symbol}): {e}")
   return (
       "\n".join(summary_data)
       if summary_data
@@ -119,7 +124,8 @@ def handle_analyze(message):
     bot.edit_message_text(
         report, chat_id=message.chat.id, message_id=waiting_msg.message_id
     )
-  except Exception:
+  except Exception as e:
+    print(f"⚠️ ANALYZE ERROR: {e}")
     bot.send_message(message.chat.id, "حدث خطأ أثناء إعداد التقرير.")
 
 
