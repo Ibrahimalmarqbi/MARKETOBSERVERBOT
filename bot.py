@@ -8,7 +8,6 @@ import pandas as pd
 import schedule
 import telebot
 import yfinance as yf
-
 # --- خادم وهمي لإرضاء Render في الخطة المجانية ---
 class SimpleServer(BaseHTTPRequestHandler):
 
@@ -17,11 +16,16 @@ class SimpleServer(BaseHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(b"Bot is active!")
 
+  def do_HEAD(self):
+    self.send_response(200)
+    self.end_headers()
+
 
 def run_http_server():
   port = int(os.environ.get("PORT", 8080))
   server = HTTPServer(("0.0.0.0", port), SimpleServer)
   server.serve_forever()
+
 
 
 # --- جلب البيانات الحساسة من متغيرات البيئة ---
