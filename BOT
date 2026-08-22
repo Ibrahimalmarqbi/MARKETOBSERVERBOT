@@ -1,3 +1,4 @@
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 import threading
 import time
@@ -8,24 +9,32 @@ import schedule
 import telebot
 import yfinance as yf
 
-# --- جلب البيانات الحساسة من متغيرات البيئة (Environment Variables) ---
+# --- خادم وهمي لإرضاء Render في الخطة المجانية ---
+class SimpleServer(BaseHTTPRequestHandler):
+
+  def do_GET(self):
+    self.send_response(200)
+    self.end_headers()
+    self.wfile.write(b"Bot is active!")
+
+
+def run_http_server():
+  port = int(os.environ.get("PORT", 8080))
+  server = HTTPServer(("0.0.0.0", port), SimpleServer)
+  server.serve_forever()
+
+
+# --- جلب البيانات الحساسة من متغيرات البيئة ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# تهيئة البوت ومحرك الذكاء الاصطناعي
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# تعليمات شخصية الخبير المالي
 SYSTEM_PROMPT = """
 أنت خبير ومحلل مالي ومستشار أسواق عالمية (Forex، ذهب، بيتكوين).
 تتحدث بأسلوب احترافي، سلس، وشخصية خبير محترف ولطيف.
-
-قواعد التعامل:
-1. عند طلب التحليل أو السؤال عن الأسواق، قدم تحليلاً شاملاً وتوقع الاتجاهات والفرص.
-2. إذا تعذر جلب الأرقام اللحظية، اعتمد على معرفتك العامة بآخر تحركات الأسواق (الذهب، EUR/USD، BTC) وحللها كخبير مالي بدون ذكر أي أعطال تقنية.
-3. التفاعل مع المستخدم دائماً بأسلوب بشري جذاب واستخدام الإيموجي المناسب.
 """
 
 FOREX_PAIRS = {
@@ -38,14 +47,7 @@ FOREX_PAIRS = {
 
 
 def generate_ai_response(prompt):
-  """توليد الرد بالذكاء الاصطناعي مع تجربة عدة نماذج لتفادي أي خطأ"""
-  available_models = [
-      "gemini-2.0-flash",
-      "gemini-1.5-flash",
-      "gemini-2.0-flash-lite",
-      "gemini-1.5-pro",
-  ]
-
+  available_models = ["gemini-2.0-flash", "gemini-1.5-flash"]
   for model_name in available_models:
     try:
       response = client.models.generate_content(
@@ -56,12 +58,10 @@ def generate_ai_response(prompt):
       return response.text
     except Exception:
       continue
-
-  return "عذراً، تعذر الاتصال بنماذج الذكاء الاصطناعي حالياً. يرجى المحاولة لاحقاً."
+  return "عذراً، تعذر الاتصال بنماذج الذكاء الاصطناعي حالياً."
 
 
 def calculate_rsi(series, period=14):
-  """حساب مؤشر القوة النسبية RSI"""
   delta = series.diff()
   gain = (delta.where(delta > 0, 0)).fillna(0)
   loss = (-delta.where(delta < 0, 0)).fillna(0)
@@ -72,7 +72,6 @@ def calculate_rsi(series, period=14):
 
 
 def fetch_market_data():
-  """جلب أحدث أرقام ومؤشرات السوق"""
   summary_data = []
   for symbol, name in FOREX_PAIRS.items():
     try:
@@ -87,62 +86,45 @@ def fetch_market_data():
         )
     except Exception:
       pass
-
-  if summary_data:
-    return "\n".join(summary_data)
-  else:
-    return "ملاحظة: تعذر الوصول لخوادم الأسعار اللحظية، قم بتحليل اتجاهات السوق العامة بناءً على آخر التحديثات."
+  return (
+      "\n".join(summary_data)
+      if summary_data
+      else "تعذر جلب البيانات اللحظية."
+  )
 
 
 def generate_expert_report():
-  """إعداد تقرير تحليلي كامل"""
   raw_data = fetch_market_data()
-  prompt = f"بيانات وملاحظات السوق الحالية:\n{raw_data}\n\nاكتب تقرير تحليلي مالي شامل كخبير تداول (حلل الذهب، العملات، البيتكوين) مع ذكر الاتجاه والمتوقع بأسلوب جذاب."
+  prompt = f"بيانات السوق الحالية:\n{raw_data}\n\nاكتب تقرير تحليلي مالي شامل كخبير تداول بأسلوب جذاب."
   return generate_ai_response(prompt)
-
-
-# --- أوامر وتفاعل البوت ---
 
 
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
-  prompt = "رحب بالعميل كخبير مالي ومستشار أسواق ووضح له الأوامر المتاحة مثل /analyze."
-  res = generate_ai_response(prompt)
+  res = generate_ai_response(
+      "رحب بالعميل كخبير مالي ووضح له الأمر /analyze."
+  )
   bot.reply_to(message, res)
 
 
 @bot.message_handler(commands=["analyze"])
 def handle_analyze(message):
-  waiting_msg = bot.reply_to(
-      message, "📈 أهلاً بك! جاري قراءة حركة الأسواق وإعداد التقرير..."
-  )
+  waiting_msg = bot.reply_to(message, "📈 جاري تحضير التقرير...")
   try:
     report = generate_expert_report()
     bot.edit_message_text(
         report, chat_id=message.chat.id, message_id=waiting_msg.message_id
     )
   except Exception:
-    bot.send_message(
-        message.chat.id, "حدث خطأ أثناء إعداد التقرير، أعد المحاولة."
-    )@bot.message_handler(func=lambda msg: True)
+    bot.send_message(message.chat.id, "حدث خطأ أثناء إعداد التقرير.")
+
+
+@bot.message_handler(func=lambda msg: True)
 def handle_chat(message):
-  user_text = message.text
-  bot.send_chat_action(message.chat.id, "typing")
-
-  if any(
-      w in user_text
-      for w in ["تحليل", "السوق", "الذهب", "البيتكوين", "متى", "اين"]
-  ):
-    market_info = fetch_market_data()
-    prompt = f"المستخدم يسأل: '{user_text}'. معطيات السوق الحالية: {market_info}. أجبه بأسلوب خبير مالي يتجاوب معه بذكاء."
-  else:
-    prompt = f"المستخدم يقول: '{user_text}'. رد عليه كخبير مالي بأسلوب تفاعلي ولطيف."
-
-  res = generate_ai_response(prompt)
+  res = generate_ai_response(
+      f"المستخدم يقول: '{message.text}'. رد عليه كخبير مالي."
+  )
   bot.reply_to(message, res)
-
-
-# --- جدولة التنبيهات الدورية والتشغيل ---
 
 
 def run_scheduler():
@@ -156,6 +138,7 @@ def run_scheduler():
 
 
 if name == "main":
+  threading.Thread(target=run_http_server, daemon=True).start()
   threading.Thread(target=run_scheduler, daemon=True).start()
-  print("🚀 تم تشغيل البوت وهو محمي الجاهزية للربط مع Render!")
+  print("🚀 البوت يعمل بنجاح!")
   bot.infinity_polling()
