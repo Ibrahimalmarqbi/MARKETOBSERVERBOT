@@ -27,6 +27,9 @@ if GEMINI_API_KEY:
 
 DB_NAME = "market_pro.db"
 
+# ذاكرة مؤقتة لحفظ آخر أصل مالي استفسر عنه كل مستخدم
+USER_LAST_SYMBOL = {}
+
 # قاموس واسع لربط المصطلحات العربية بأكواد التداول العالمية
 ARABIC_ASSETS = {
     "الذهب": "PAXG",
@@ -99,7 +102,6 @@ def get_robust_closes(symbol):
     if not closes:
         closes = fetch_klines_cryptocompare(symbol)
     if not closes:
-        # احتياطي مباشر لضمان عدم توقف التحليل نهائياً
         base_price = 2650.0 if symbol.upper() == "PAXG" else (65000.0 if symbol.upper() == "BTC" else 150.0)
         closes = [base_price + (i * 0.1) for i in range(100)]
     return closes
@@ -143,7 +145,7 @@ def get_market_indicators(symbol):
     formatted_str = f"📊 **البيانات الفنية اللحظية لـ ({symbol.upper()}):**\n• السعر الحالي: **{curr_price}$**\n• مؤشر RSI: **{rsi}**\n• المتوسط SMA(50): **{sma50}$**\n• المتوسط SMA(200): **{sma200}$**"
     return data_dict, formatted_str
 
-# 4. محرك توليد التقرير التحليلي المستقل والمضمون
+# 4. محركات التوليد البرمجي المباشر عند تعثر الذكاء الاصطناعي
 def generate_programmatic_analysis(symbol, data):
     price = data['price']
     rsi = data['rsi']
@@ -157,7 +159,7 @@ def generate_programmatic_analysis(symbol, data):
     
     asset_name = "الذهب (XAU/USD)" if symbol.upper() == "PAXG" else symbol.upper()
     
-    report = (
+    return (
         f"🏆 **تقرير التحليل الفني الشامل لـ {asset_name}:**\n\n"
         f"• **السعر الحالي:** {price}$\n"
         f"• **الاتجاه العام اللحظي:** {trend}\n"
@@ -170,12 +172,39 @@ def generate_programmatic_analysis(symbol, data):
         f"في حال اختراق المقاومة عند {resistance}$ يُتوقع استمرار الصعود، بينما كسر الدعم عند {support}$ قد يؤدي لتراجعات إضافية. "
         f"ينصح دائماً بإدارة المخاطر وتحديد أمر وقف الخسارة قبل فتح أي صفقة."
     )
-    return report
+
+def generate_buy_sell_advice(symbol, data):
+    price = data['price']
+    rsi = data['rsi']
+    sma50 = data['sma50']
+    support = round(price * 0.988, 2)
+    resistance = round(price * 1.012, 2)
+    asset_name = "الذهب" if symbol.upper() == "PAXG" else symbol.upper()
+    
+    if rsi > 70:
+        advice = f"⚠️ **توصية {asset_name}: عدم الشراء الآن!**\nمؤشر RSI مرتفع جداً ({rsi}) ويشير لتشبع شرائي. يُفضل انتظار تصحيح هابط نحو مستويات {support}$ قبل التفكير بالشراء."
+    elif rsi < 30:
+        advice = f"🟢 **توصية {asset_name}: فرصة شراء ممتازة (ارتداد متوقع)!**\nمؤشر RSI في منطقة تشبع بيعي ({rsi}). يُمكن الشراء بالقرب من {price}$ مع وضع وقف خسارة أسفل {support}$."
+    elif price >= sma50:
+        advice = f"🔵 **توصية {asset_name}: الاتجاه صاعد (مراعاة إدارة المخاطر).**\nالسعر أعلى متوسط 50 ساعة. يُمكن دخول صفقة شراء مع هدف عند {resistance}$ ووقف خسارة عند {support}$."
+    else:
+        advice = f"🔴 **توصية {asset_name}: الاتجاه يميل للهبوط.**\nالسعر أسفل متوسط 50 ساعة. يُفضل الانتظار حتى استقرار السعر أو إعادة اختبار المقاومة عند {resistance}$."
+        
+    return advice
+
+def generate_risk_explanation():
+    return (
+        "🛡️ **دليل إدارة المخاطر الاحترافي للتداول:**\n\n"
+        "1️⃣ **قاعدة الـ 2%:** لا تخاطر بأكثر من 2% من رأس مالك في الصفقة الواحدة.\n"
+        "2️⃣ **أمر وقف الخسارة (Stop Loss):** حدد نقطة الخروج مسبقاً ولا تقم بتغييرها أثناء التداول.\n"
+        "3️⃣ **حساب اللوت (Position Size):** استخدم أمر البوت لحساب حجم العقد المناسب لصفقتك:\n"
+        "👉 `/risk <رأس_المال> <نسبة_المخاطرة> <سعر_الدخول> <وقف_الخسارة>`\n\n"
+        "💡 **مثال:** `/risk 1000 2 2650 2630` (يحسب لك اللوت بدقة متناهية لحماية حسابك)."
+    )
 
 # 5. توليد المخطط البياني (Chart)
 def generate_chart(symbol):
     closes = get_robust_closes(symbol)
-    
     plt.figure(figsize=(8, 4))
     plt.plot(closes[-40:], label=f"{symbol.upper()} Trend", color='#00ff88', linewidth=2)
     plt.title(f"Price Chart: {symbol.upper()}", color='white')
@@ -199,45 +228,18 @@ def add_user(chat_id):
     conn.commit()
     conn.close()
 
-def get_all_users():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT chat_id FROM users")
-    users = [row[0] for row in c.fetchall()]
-    conn.close()
-    return users
-
-def get_learned_lessons():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT lesson FROM lessons")
-    lessons = [f"- {row[0]}" for row in c.fetchall()]
-    conn.close()
-    return "\n".join(lessons) if lessons else "الالتزام بقواعد إدارة المخاطر."
-
-def save_auto_lesson(lesson_text):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT INTO lessons (lesson) VALUES (?)", (lesson_text,))
-    conn.commit()
-    conn.close()
-
-# 7. محرك الاستجابة الذكية لـ Gemini
+# 7. محرك Gemini الذكي
 def get_system_instruction(symbol_data_str=""):
-    lessons = get_learned_lessons()
     return f"""
 أنت محلل مالي واقتصادي ومخاطر ذكي وخبير في الأسواق والعملات والمعادن.
 تم تطوير هذا النظام بواسطة المهندس إبراهيم المرقبي.
 
 توجيهات الإجابة:
-1. قدم تحليلاً فنياً واقتصادياً شاملاً متضمناً الدعم والمقاومة والاتجاه والتوصية المالية.
-2. أجب بدقة ومباشرة كخبير مالي بدون كليشيهات تكرارية.
+1. قدم تحليلاً وتوصيات مباشرة وواضحة جداً.
+2. إذا سأل المستخدم عن الشراء أو البيع أو إدارة المخاطر، أجب بشكل مباشر وعملي.
 
 بيانات السوق الحالية:
 {symbol_data_str}
-
-الدروس السابقة:
-{lessons}
 """
 
 def ask_gemini(prompt, symbol_data_raw=None, symbol_data_str=""):
@@ -261,11 +263,23 @@ def ask_gemini(prompt, symbol_data_raw=None, symbol_data_str=""):
                 print(f"Gemini Error ({model_name}): {e}")
                 continue
 
-    # في حال عدم استجابة الذكاء الاصطناعي: يتم توليد التقرير التحليلي فوراً
+    # محرك احتياطي مالي متطور عند عدم استجابة Gemini
+    text_lower = prompt.lower()
+    
+    # حالة السؤال عن الشراء أو البيع
+    if any(w in text_lower for w in ["اشتري", "ابيع", "أشتري", "أبيع", "شراء", "بيع", "توصية", "تنصح"]):
+        if symbol_data_raw:
+            return generate_buy_sell_advice(symbol_data_raw.get("symbol", "PAXG"), symbol_data_raw)
+            
+    # حالة السؤال عن إدارة المخاطر
+    if any(w in text_lower for w in ["مخاطر", "مخاطره", "إدارة المخاطر", "ادارة المخاطر"]):
+        return generate_risk_explanation()
+        
+    # حالة طلب التحليل الفني العام
     if symbol_data_raw:
         return generate_programmatic_analysis(symbol_data_raw.get("symbol", "PAXG"), symbol_data_raw)
     
-    return "أهلاً بك! أنا جاهز تماماً لتحليل الذهب، العملات الرقمية، والأسهم، وحساب إدارة المخاطر. أرسل اسم الأصل أو طلبك مباشرة!"
+    return generate_risk_explanation()
 
 # 8. خادم Flask لاستقرار Render
 app = Flask(__name__)
@@ -288,7 +302,8 @@ def start_cmd(message):
         "أهلاً بك في منصة **MarketObserver Pro** 📈\n"
         "المطور والمصمم: **المهندس إبراهيم المرقبي**\n\n"
         "💡 **كيفية الاستخدام:**\n"
-        "• اكتب اسم أي عملة أو معدن لتحليله فوراً (مثال: `اريد تحليل الذهب`، `BTC`، `البيتكوين`).\n"
+        "• اكتب اسم أي عملة أو معدن لتحليله فوراً (مثال: `تحليل الذهب`، `BTC`، `البيتكوين`).\n"
+        "• يمكنك سؤال البوت بعدها مباشرة: `ايش تنصح اشتري او ابيع؟` وسيتذكر العملة فوراً.\n"
         "• `/chart <الرمز>` : لطلب رسم بياني مباشر (مثال: `/chart PAXG`).\n"
         "• `/risk <رأس_المال> <نسبة_المخاطرة_%> <سعر_الدخول> <وقف_الخسارة>` : لحساب حجم اللوت."
     )
@@ -326,22 +341,23 @@ def risk_cmd(message):
             f"🛡️ **نتيجة حساب إدارة المخاطر:**\n\n"
             f"💰 **رأس المال:** {cap}$\n"
             f"📉 **المبلغ المخاطر به:** {round(risk_amount, 2)}$ ({r_pct}%)\n"
-            f"📊 **حجم الموقف المقترح:** **{round(pos_size, 4)} وحدة**"
+            f"📊 **حجم الموقف المقترح (Position Size):** **{round(pos_size, 4)} وحدة**"
         )
         bot.reply_to(message, msg, parse_mode="Markdown")
     except Exception:
-        bot.reply_to(message, "📖 **الصيغة الصحيحة:**\n`/risk <رأس_المال> <نسبة_المخاطرة_%> <سعر_الدخول> <وقف_الخسارة>`\nمثال: `/risk 1000 2 65000 64000`", parse_mode="Markdown")
+        bot.reply_to(message, "📖 **الصيغة الصحيحة:**\n`/risk <رأس_المال> <نسبة_المخاطرة_%> <سعر_الدخول> <وقف_الخسارة>`\nمثال: `/risk 1000 2 2650 2630`", parse_mode="Markdown")
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
-    add_user(message.chat.id)
+    chat_id = message.chat.id
+    add_user(chat_id)
     try:
-        bot.send_chat_action(message.chat.id, 'typing')
+        bot.send_chat_action(chat_id, 'typing')
         text = message.text.strip()
         
         target_symbol = ""
         
-        # 1. مطابقة الكلمات العربية لتعيين الأصل المالي
+        # 1. المطابقة العربية للأصل المالي
         for ar_word, symbol in ARABIC_ASSETS.items():
             if ar_word in text.lower():
                 target_symbol = symbol
@@ -353,26 +369,25 @@ def handle_text(message):
             if len(words) == 1 and words[0].isalpha() and words[0].isascii() and 2 <= len(words[0]) <= 6:
                 target_symbol = words[0].upper()
 
-        data_raw, indicators_str = get_market_indicators(target_symbol if target_symbol else "PAXG")
-
-        # إذا طلب المستخدم الذهب أو أي أصل مالي، يضمن البوت إرسال التقرير التحليلي فوراً
+        # 3. استخدام ذاكرة الجلسة إذا لم يُذكر رمز في الرسالة الحالية
         if target_symbol:
-            reply_text = ask_gemini(text, symbol_data_raw=data_raw, symbol_data_str=indicators_str)
-            if "🏆 **تقرير التحليل الفني" in reply_text:
-                full_response = reply_text
-            else:
-                full_response = f"{indicators_str}\n\n💡 **التحليل والتوصية:**\n{reply_text}"
+            USER_LAST_SYMBOL[chat_id] = target_symbol
         else:
-            full_response = ask_gemini(text)
-            
-        for chunk in [full_response[i:i+4000] for i in range(0, len(full_response), 4000)]:
+            target_symbol = USER_LAST_SYMBOL.get(chat_id, "PAXG") # الذهب كافتراضي للذاكرة
+
+        data_raw, indicators_str = get_market_indicators(target_symbol)
+        if data_raw:
+            data_raw["symbol"] = target_symbol
+
+        # توليد الرد من الذكاء الاصطناعي أو المحرك الفني الاحتياطي
+        reply_text = ask_gemini(text, symbol_data_raw=data_raw, symbol_data_str=indicators_str)
+        
+        for chunk in [reply_text[i:i+4000] for i in range(0, len(reply_text), 4000)]:
             bot.reply_to(message, chunk, parse_mode="Markdown")
             
     except Exception as e:
         print(f"Handler Error: {e}")
-        # تقرير تحليلي آلي في حالة الأخطاء المفاجئة للذهب
-        data_raw, _ = get_market_indicators("PAXG")
-        bot.reply_to(message, generate_programmatic_analysis("PAXG", data_raw), parse_mode="Markdown")
+        bot.reply_to(message, generate_risk_explanation(), parse_mode="Markdown")
 
 # 10. التشغيل
 if __name__ == "__main__":
