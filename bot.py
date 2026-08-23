@@ -138,24 +138,30 @@ def save_auto_lesson(lesson_text):
     conn.commit()
     conn.close()
 
-# 6. بناء تعليمات النظام لـ Gemini
+# 6. أسماء النماذج الرسمية لـ Gemini
+MODELS_TO_TRY = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+
+# 7. بناء تعليمات النظام الذكية للشخصية والنطاق
 def get_system_instruction(symbol_data=""):
     lessons = get_learned_lessons()
     return f"""
-أنت خبير مالي ومحلل أسواق معتمد ومختص في التداول الفني وإدارة المخاطر.
-تصميم وتطوير: المهندس إبراهيم المرقبي.
+أنت مساعد مالي ومحلل أسواق ذكي ومحترف.
+تطوير وتصميم: المهندس إبراهيم المرقبي.
 
-القواعد والأسس الصارمة:
-1. كن مقتصداً جداً ومباشراً في إجاباتك دون أي مقدمات أو سلام مطول.
-2. نطاقك محدد حصراً بالمال، الأسهم، التداول، والعملات الرقمية والفوركس.
-3. استند للبيانات الفنية التالية إن وجدت:
+تعليمات التعامل والردود:
+1. إذا أرسل المستخدم تحية أو سؤالاً عاماً (مثل: "كيفك؟"، "مرحبا"، "هل عندك مشاعر؟"):
+   - رد بذكاء ولباقة وبشكل طبيعي جداً، ووضح له بأسلوب رصين أنك نظام ذكي متخصص في تحليل الأسواق والتداول وإدارة المخاطر فقط.
+2. إذا سألك المستخدم عن كيفية استخدام البوت أو أمر /risk أو /chart أو شرح استخدام كود المخاطرة:
+   - اشرح له بأسلوب بسيط ومباشر مع أمثلة تطبيقية، ولا تكتب له أي كود برمجي مطلقاً (مثل بلغة Python).
+3. عند السؤال عن العملات أو الأسهم أو التداول:
+   - قدم تحليلاً مالياً وفنياً موجزاً ومباشراً بدون مقدمات طويلة.
+
+بيانات السوق الفنية (إن وجدت):
 {symbol_data}
 
-**الذاكرة الذاتية لتجنب الأخطاء السابقة (دروس عصبية متراكمة):**
+الذاكرة الذاتية والدروس السابقة:
 {lessons}
 """
-
-MODELS_TO_TRY = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash-latest"]
 
 def ask_gemini(prompt, symbol_data=""):
     for model_name in MODELS_TO_TRY:
@@ -167,11 +173,12 @@ def ask_gemini(prompt, symbol_data=""):
             response = model.generate_content(prompt)
             if response and response.text:
                 return response.text
-        except Exception:
+        except Exception as e:
+            print(f"Model {model_name} error: {e}")
             continue
-    return "❌ تعذر تحليل السوق حالياً."
+    return "أنا مساعد مالي متخصص في تحليل الأسواق والتداول وإدارة المخاطر. كيف يمكنني مساعدتك في مجال التداول اليوم؟"
 
-# 7. محرك التقييم وتتبع الصفقات الذاتي (Auto Learning Loop)
+# 8. محرك التقييم وتتبع الصفقات الذاتي (Auto Learning Loop)
 def auto_learning_loop():
     while True:
         time.sleep(300)
@@ -207,7 +214,7 @@ def auto_learning_loop():
         except Exception as e:
             print(f"Loop Error: {e}")
 
-# 8. خادم Flask لإرضاء Render
+# 9. خادم Flask لإرضاء Render
 app = Flask(__name__)
 
 @app.route('/')
@@ -218,7 +225,7 @@ def run_server():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# 9. معالجة الأوامر والرسائل
+# 10. معالجة الأوامر والرسائل
 
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
@@ -305,18 +312,32 @@ def handle_text(message):
     add_user(message.chat.id)
     try:
         bot.send_chat_action(message.chat.id, 'typing')
-        symbol = message.text.strip().split()[0]
-        indicators = get_market_indicators(symbol)
+        text = message.text.strip()
+        words = text.split()
         
-        reply_text = ask_gemini(message.text, symbol_data=indicators)
+        indicators = ""
+        # التثبت من أن النص عبارة عن رمز عملة أجنبي فقط قبل جلب بيانات السوق
+        if len(words) == 1 and words[0].isalpha() and words[0].isascii() and 2 <= len(words[0]) <= 6:
+            symbol = words[0].upper()
+            market_data = get_market_indicators(symbol)
+            if "غير متاحة" not in market_data:
+                indicators = market_data
+
+        reply_text = ask_gemini(text, symbol_data=indicators)
         
-        full_response = f"{indicators}\n\n💡 **التحليل والتوصية:**\n{reply_text}"
+        if indicators:
+            full_response = f"{indicators}\n\n💡 **التحليل والتوصية:**\n{reply_text}"
+        else:
+            full_response = reply_text
+            
         for chunk in [full_response[i:i+4000] for i in range(0, len(full_response), 4000)]:
             bot.reply_to(message, chunk, parse_mode="Markdown")
+            
     except Exception as e:
         print(f"Error: {e}")
+        bot.reply_to(message, "أنا مساعدك المالي المتخصص في تحليل الأسواق والتداول. تفضل بطرح سؤالك حول العملات أو إدارة المخاطر.")
 
-# 10. التشغيل الحسي والتزمني
+# 11. التشغيل
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=auto_learning_loop, daemon=True).start()
