@@ -38,17 +38,19 @@ def init_db():
 
 init_db()
 
-# 3. محرك تحليل البيانات الفنية والمؤشرات الرياضية
-def fetch_klines(symbol, interval="1h", limit=100):
+# 3. محرك جلب البيانات الفنية المباشرة عبر CryptoCompare (لتفادي حظر Render)
+def fetch_klines(symbol, limit=100):
     try:
-        clean_symbol = symbol.upper().replace("/", "").replace("-", "")
-        if not clean_symbol.endswith("USDT") and not clean_symbol.endswith("BUSD"):
-            clean_symbol += "USDT"
-        url = f"https://api.binance.com/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
+        clean_symbol = symbol.upper().replace("/", "").replace("-", "").replace("USDT", "")
+        url = f"https://min-api.cryptocompare.com/data/v2/histo/hour?fsym={clean_symbol}&tsym=USDT&limit={limit}"
         res = requests.get(url, timeout=5).json()
-        closes = [float(k[4]) for k in res]
-        return closes
-    except Exception:
+        
+        if 'Data' in res and 'Data' in res['Data'] and 'Data' in res['Data']:
+            closes = [float(item['close']) for item in res['Data']['Data']]
+            return closes if closes else None
+        return None
+    except Exception as e:
+        print(f"Fetch Error: {e}")
         return None
 
 def calculate_rsi(closes, period=14):
@@ -82,7 +84,7 @@ def get_market_indicators(symbol):
     sma50 = round(sum(closes[-50:]) / 50, 2) if len(closes) >= 50 else "N/A"
     sma200 = round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else "N/A"
     
-    return f"📊 **بيانات السوق الفنية اللحظية لـ ({symbol.upper()}):**\n- السعر الحالي: {curr_price}\n- مؤشر القوة النسبية RSI: {rsi}\n- المتوسط المتحرك SMA(50): {sma50}\n- المتوسط المتحرك SMA(200): {sma200}"
+    return f"📊 **بيانات السوق الفنية اللحظية لـ ({symbol.upper()}):**\n- السعر الحالي: {curr_price}$\n- مؤشر القوة النسبية RSI: {rsi}\n- المتوسط المتحرك SMA(50): {sma50}\n- المتوسط المتحرك SMA(200): {sma200}"
 
 # 4. توليد المخطط البياني (Chart Generator)
 def generate_chart(symbol):
@@ -105,7 +107,7 @@ def generate_chart(symbol):
     plt.close()
     return buf
 
-# 5. إدارة قاعدة البيانات والذاكرة
+# 5. إدارة قاعدة البيانات والذاكرة العصبية
 def add_user(chat_id):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -127,7 +129,7 @@ def get_learned_lessons():
     c.execute("SELECT lesson FROM lessons")
     lessons = [f"- {row[0]}" for row in c.fetchall()]
     conn.close()
-    return "\n".join(lessons) if lessons else "لا توجد أخطاء مسجلة، النطاق يعمل بالمعايير القياسية."
+    return "\n".join(lessons) if lessons else "لا توجد أخطاء مسجلة بعد، النظام يعمل بالمعايير القياسية."
 
 def save_auto_lesson(lesson_text):
     conn = sqlite3.connect(DB_NAME)
@@ -143,13 +145,13 @@ def get_system_instruction(symbol_data=""):
 أنت خبير مالي ومحلل أسواق معتمد ومختص في التداول الفني وإدارة المخاطر.
 تصميم وتطوير: المهندس إبراهيم المرقبي.
 
-القواعد والأسس:
-1. كن مقتصداً جداً ومباشراً في إجاباتك دون أي مقدمات.
-2. نطاقك محدد حصراً بالمال، الأسهم، التداول، والعملات.
+القواعد والأسس الصارمة:
+1. كن مقتصداً جداً ومباشراً في إجاباتك دون أي مقدمات أو سلام مطول.
+2. نطاقك محدد حصراً بالمال، الأسهم، التداول، والعملات الرقمية والفوركس.
 3. استند للبيانات الفنية التالية إن وجدت:
 {symbol_data}
 
-**الذاكرة الذاتية لتجنب الأخطاء السابقة:**
+**الذاكرة الذاتية لتجنب الأخطاء السابقة (دروس عصبية متراكمة):**
 {lessons}
 """
 
@@ -169,7 +171,7 @@ def ask_gemini(prompt, symbol_data=""):
             continue
     return "❌ تعذر تحليل السوق حالياً."
 
-# 7. محرك التقييم وتتبع الصفقات الذاتي
+# 7. محرك التقييم وتتبع الصفقات الذاتي (Auto Learning Loop)
 def auto_learning_loop():
     while True:
         time.sleep(300)
@@ -186,47 +188,48 @@ def auto_learning_loop():
                     continue
                 curr_price = closes[-1]
                 
-                # النجاح
+                # حالة النجاح
                 if (direction == "BUY" and curr_price >= tp) or (direction == "SELL" and curr_price <= tp):
                     c.execute("UPDATE signals SET status = 'SUCCESS' WHERE id = ?", (sig_id,))
                     conn.commit()
                     for u in get_all_users():
-                        bot.send_message(u, f"🎯 **صفقة ناجحة!**\nتحقق هدف الربح لـ {symbol} عند {curr_price}")
+                        bot.send_message(u, f"🎯 **صفقة ناجحة!**\nتم تحقيق هدف الربح لـ {symbol} عند سعر {curr_price}$")
                 
-                # التعلم التلقائي عند الخسارة
+                # حالة التعلم التلقائي عند الخسارة
                 elif (direction == "BUY" and curr_price <= sl) or (direction == "SELL" and curr_price >= sl):
                     c.execute("UPDATE signals SET status = 'FAILED' WHERE id = ?", (sig_id,))
                     conn.commit()
-                    lesson = ask_gemini(f"فشلت صفقة {symbol} عند {curr_price}. اكتب صياغة محددة جداً كقاعدة لمنع تكرار الخطأ.")
-                    save_auto_lesson(f"تنبيه {symbol}: {lesson}")
+                    lesson = ask_gemini(f"فشلت صفقة {symbol} عند سعر {curr_price}$. اكتب قاعدة فنّية موجزة لمنع تكرار هذا الخطأ مستقبلاً.")
+                    save_auto_lesson(f"تنبيه صفقة {symbol}: {lesson}")
                     for u in get_all_users():
-                        bot.send_message(u, f"⚠️ **تحديث صفقة {symbol}:**\nوصل السعر لوقف الخسارة. استخرج البوت قاعدة جديدة ودونّها في شبكته العصبية لتجنب تكرارها.")
+                        bot.send_message(u, f"⚠️ **تحديث صفقة {symbol}:**\nوصل السعر لوقف الخسارة. تم تحليل السبب وإضافة درس جديد لشبكة البوت الذاتية لتجنب تكراره.")
             conn.close()
         except Exception as e:
             print(f"Loop Error: {e}")
 
-# 8. خادم Flask
+# 8. خادم Flask لإرضاء Render
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "MarketObserver Ultimate Bot Active"
+    return "MarketObserver Ultimate Pro Bot Active"
 
 def run_server():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# 9. الأوامر والرسائل
+# 9. معالجة الأوامر والرسائل
+
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     add_user(message.chat.id)
     bot.reply_to(
         message, 
         "أهلاً بك في منصة **MarketObserver Pro** 📈\n"
-        "المطور: **المهندس إبراهيم المرقبي**\n\n"
-        "**الأوامر المتاحة:**\n"
-        "• أرسل اسم العملة/السهم للتحليل المباشر (مثل: BTC, ETH, NVDA).\n"
-        "• `/chart <رمز>` : لحصول على الرسم البياني المباشر.\n"
+        "المطور والمصمم: **المهندس إبراهيم المرقبي**\n\n"
+        "**الأوامر والخدمات المتاحة:**\n"
+        "• أرسل اسم العملة/السهم للتحليل الفني والمالي المباشر (مثال: `BTC`, `ETH`, `NVDA`).\n"
+        "• `/chart <الرمز>` : للحصول على المخطط البياني المباشر.\n"
         "• `/risk <رأس_المال> <نسبة_المخاطرة_%> <سعر_الدخول> <وقف_الخسارة>` : لحساب حجم اللوت وإدارة المخاطر."
     )
 
@@ -234,38 +237,68 @@ def start_cmd(message):
 def chart_cmd(message):
     args = message.text.split()
     if len(args) < 2:
-        bot.reply_to(message, "⚠️ يرجى كتابة الرمز بعد الأمر، مثال: `/chart BTC`", parse_mode="Markdown")
+        guide_msg = (
+            "📈 **دليل استخدام أمر الرسم البياني (`/chart`):**\n\n"
+            "يقوم هذا الأمر بتوليد رسم بياني لحركة السعر لمساعدتك في تحديد الاتجاه.\n\n"
+            "✏️ **طريقة الاستخدام:**\n"
+            "اكتب الأمر متبوعاً برمز العملة أو السهم مباشرة.\n\n"
+            "💡 **أمثلة جاهزة للتجربة (اضغط للنسخ):**\n"
+            "• `/chart BTC` — لرسم بياني البيتكوين\n"
+            "• `/chart ETH` — لرسم بياني الإيثريوم\n"
+            "• `/chart SOL` — لرسم بياني سولانا"
+        )
+        bot.reply_to(message, guide_msg, parse_mode="Markdown")
         return
+        
     symbol = args[1]
     bot.send_chat_action(message.chat.id, 'upload_photo')
     chart_img = generate_chart(symbol)
     if chart_img:
         bot.send_photo(message.chat.id, chart_img, caption=f"📈 **المخطط البياني المباشر لـ {symbol.upper()}**")
     else:
-        bot.reply_to(message, "❌ تعذر تعقب البيانات البيانية لهذا الرمز.")
+        bot.reply_to(message, f"❌ **تعذر تعقب الرمز `{symbol.upper()}`**\nيرجى التأكد من كتابة رمز العملة بشكل صحيح (مثال: BTC, ETH, SOL).", parse_mode="Markdown")
 
 @bot.message_handler(commands=['risk'])
 def risk_cmd(message):
     try:
-        _, capital, risk_pct, entry, sl = message.text.split()
+        parts = message.text.split()
+        if len(parts) != 5:
+            raise ValueError("Invalid parameters")
+            
+        _, capital, risk_pct, entry, sl = parts
         cap, r_pct, ent, stop = float(capital), float(risk_pct), float(entry), float(sl)
         
         risk_amount = cap * (r_pct / 100.0)
         price_diff = abs(ent - stop)
         if price_diff == 0:
-            bot.reply_to(message, "⚠️ سعر الدخول ووقف الخسارة متطابقان!")
+            bot.reply_to(message, "⚠️ **خطأ:** سعر الدخول ووقف الخسارة متطابقان! يرجى تحديد فارق سعري بينهما.")
             return
             
         pos_size = risk_amount / price_diff
         msg = (
-            f"🛡️ **حاسبة إدارة المخاطر:**\n\n"
-            f"- المبلغ المخاطر به: **{round(risk_amount, 2)}$** ({r_pct}%)\n"
-            f"- حجم الموقف المقترح (Position Size): **{round(pos_size, 4)} وحدة**\n"
-            f"💡 *التزم بحجم الموقف لحماية رأس مالك من تقلبات السوق.*"
+            f"🛡️ **نتيجة حساب إدارة المخاطر:**\n\n"
+            f"💰 **رأس المال:** {cap}$\n"
+            f"📉 **المبلغ المخاطر به:** {round(risk_amount, 2)}$ (بنسبة {r_pct}%)\n"
+            f"📊 **حجم الموقف المقترح (Position Size):** **{round(pos_size, 4)} وحدة**\n\n"
+            f"💡 *التزم بهذا الحجم لحماية حسابك من تقلبات السوق.*"
         )
         bot.reply_to(message, msg, parse_mode="Markdown")
+        
     except Exception:
-        bot.reply_to(message, "⚠️ الصيغة خاطئة! استخدم:\n`/risk <Capital> <Risk%> <Entry> <SL>`\nمثال:\n`/risk 1000 2 65000 64000`", parse_mode="Markdown")
+        guide_msg = (
+            "📖 **دليل استخدام حاسبة إدارة المخاطر (`/risk`):**\n\n"
+            "تساعدك هذه الحاسبة على معرفة الكمية المناسبة للشراء حتى لا تتجاوز خسارتك النسبة التي تحددها من رأس مالك.\n\n"
+            "✏️ **الصيغة المطلوبة:**\n"
+            "`/risk <رأس_المال> <نسبة_المخاطرة_%> <سعر_الدخول> <وقف_الخسارة>`\n\n"
+            "🔍 **شرح البيانات:**\n"
+            "1️⃣ **رأس المال:** إجمالي المبلغ في حسابك (مثال: `1000`)\n"
+            "2️⃣ **نسبة المخاطرة:** النسبة المئوية المسموح بخسارتها (مثال: `2` لـ 2%)\n"
+            "3️⃣ **سعر الدخول:** السعر الذي ستشتري عنده (مثال: `65000`)\n"
+            "4️⃣ **وقف الخسارة:** السعر الذي ستخرج عنده في حال هبط السوق (مثال: `64000`)\n\n"
+            "💡 **مثال عملي (اضغط عليه للنسخ والتجربة فوراً):**\n"
+            "`/risk 1000 2 65000 64000`"
+        )
+        bot.reply_to(message, guide_msg, parse_mode="Markdown")
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
@@ -283,11 +316,11 @@ def handle_text(message):
     except Exception as e:
         print(f"Error: {e}")
 
-# 10. التشغيل
+# 10. التشغيل الحسي والتزمني
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=auto_learning_loop, daemon=True).start()
-    print("🚀 تم تشغيل البوت الاحترافي الشامل...")
+    print("🚀 تم تشغيل البوت الاحترافي الشامل المطور: المهندس إبراهيم المرقبي...")
     
     while True:
         try:
