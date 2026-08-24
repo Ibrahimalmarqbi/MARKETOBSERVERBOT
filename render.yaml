@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: marketobserverbot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: ADMIN_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DEFAULT_INTERVAL
+        value: 1h
+      - key: ALERT_POLL_SECONDS
+        value: "60"
+      - key: PAPER_TRADING
+        value: "true"
+      - key: MAX_RISK_PERCENT
+        value: "2"
+      - key: MAX_POSITION_NOTIONAL
+        value: "10000"
+      - key: ALLOW_LIVE_TRADING
+        value: "false"
