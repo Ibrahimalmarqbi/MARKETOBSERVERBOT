@@ -16,11 +16,14 @@ from telebot import types
 
 from marketobserver.assets import ASSETS, Asset, resolve_asset
 from marketobserver.analysis import Analysis, analyze
+from marketobserver.advisor import Advice, build_advice
+from marketobserver.nlp import parse_request
 from marketobserver.broker import LiveBrokerNotConfigured, OrderRequest, PaperBroker
 from marketobserver.config import Settings
 from marketobserver.db import Database
 from marketobserver.market_data import DataUnavailable, MarketDataProvider
 from marketobserver.risk import calculate_position_size
+from marketobserver.llm import GroundedLLM
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("marketobserver")
@@ -29,6 +32,7 @@ settings = Settings.from_env()
 db = Database(settings.database_url)
 db.create_all()
 market = MarketDataProvider()
+llm = GroundedLLM(settings.llm_api_key, settings.llm_api_base, settings.llm_model)
 paper_broker = PaperBroker()
 live_broker = LiveBrokerNotConfigured()
 bot = telebot.TeleBot(settings.telegram_token, threaded=True)
@@ -96,6 +100,52 @@ def analysis_text(asset: Asset, result: Analysis, lang: str) -> str:
         f"Data source: `{market.last_source(asset.key) or 'unknown'}`\n"
         "This is automated indicator analysis, not a guarantee or personalized advice."
     )
+
+
+def advice_text(advice: Advice, lang: str) -> str:
+    if lang == "ar":
+        action = {"watch_long": "مراقبة شراء مشروطة", "watch_short": "مراقبة بيع مشروطة", "wait": "انتظار"}[advice.action]
+        lines = [
+            f"مساعد القرار: {advice.asset.name_ar} ({advice.asset.key})",
+            f"السعر المرجعي: {advice.current_price} {advice.asset.quote}",
+            f"الحالة: {action} | الثقة: {advice.confidence}",
+            f"السبب: {advice.reason}",
+        ]
+        if advice.entry_low is not None:
+            lines += [
+                f"منطقة الدخول النظرية: {advice.entry_low} - {advice.entry_high}",
+                f"مستوى إلغاء السيناريو: {advice.invalidation}",
+                f"الهدف الأول: {advice.target_one}",
+                f"الهدف الثاني: {advice.target_two}",
+                f"العائد/المخاطرة التقريبي: 1:{advice.risk_reward}",
+            ]
+        lines += [
+            "الأطر المستخدمة: " + ", ".join(view.timeframe for view in advice.views),
+            f"المصدر: {advice.source or 'غير معروف'} | آخر تحديث: {advice.as_of}",
+            "هذه سيناريوهات مشروطة وليست ضمانًا أو توصية شخصية. لا تدخل دون تحديد رأس المال والمخاطرة ووقف الخسارة.",
+        ]
+        return "\\n".join(lines)
+    action = {"watch_long": "Conditional long watch", "watch_short": "Conditional short watch", "wait": "Wait"}[advice.action]
+    lines = [
+        f"Decision assistant: {advice.asset.name_en} ({advice.asset.key})",
+        f"Reference price: {advice.current_price} {advice.asset.quote}",
+        f"State: {action} | confidence: {advice.confidence}",
+        f"Reason: {advice.reason}",
+    ]
+    if advice.entry_low is not None:
+        lines += [
+            f"Theoretical entry zone: {advice.entry_low} - {advice.entry_high}",
+            f"Scenario invalidation: {advice.invalidation}",
+            f"Target one: {advice.target_one}",
+            f"Target two: {advice.target_two}",
+            f"Approximate reward/risk: 1:{advice.risk_reward}",
+        ]
+    lines += [
+        "Timeframes: " + ", ".join(view.timeframe for view in advice.views),
+        f"Source: {advice.source or 'unknown'} | last update: {advice.as_of}",
+        "These are conditional scenarios, not a guarantee or personalized advice. Define capital, risk, and a stop before acting.",
+    ]
+    return "\\n".join(lines)
 
 
 def chart(asset: Asset, candles: list) -> io.BytesIO:
@@ -260,20 +310,48 @@ def text_cmd(message: types.Message):
     text = (message.text or "").strip()
     if text.startswith("/"):
         return
-    asset = resolve_asset(text)
+    user = db.get_user(message.chat.id)
+    request = parse_request(text, user.last_asset if user else None)
+    asset = request.asset
     remember_user(message, asset)
-    lang = user_language(message)
+    lang = request.language
     if asset:
         try:
-            result, _ = get_analysis(asset)
-            bot.reply_to(message, analysis_text(asset, result, lang), parse_mode="Markdown")
+            if request.intent == "advice":
+                advice = build_advice(market, asset, request.timeframe)
+                facts = {
+                    "asset": advice.asset.key,
+                    "price": advice.current_price,
+                    "action": advice.action,
+                    "confidence": advice.confidence,
+                    "reason": advice.reason,
+                    "entry_low": advice.entry_low,
+                    "entry_high": advice.entry_high,
+                    "invalidation": advice.invalidation,
+                    "target_one": advice.target_one,
+                    "target_two": advice.target_two,
+                    "risk_reward": advice.risk_reward,
+                    "timeframes": [view.timeframe for view in advice.views],
+                    "source": advice.source,
+                    "as_of": advice.as_of,
+                }
+                if llm.enabled:
+                    try:
+                        bot.reply_to(message, llm.explain(lang, text, facts))
+                        return
+                    except Exception:
+                        logger.exception("grounded LLM explanation failed; using deterministic response")
+                bot.reply_to(message, advice_text(advice, lang))
+            else:
+                result, _ = get_analysis(asset)
+                bot.reply_to(message, analysis_text(asset, result, lang))
         except DataUnavailable:
-            bot.reply_to(message, AR["data_error"] if lang == "ar" else "Reliable market data is unavailable right now.")
+            bot.reply_to(message, AR["data_error"] if lang == "ar" else "Reliable market data is unavailable right now. No synthetic data was used.")
         except Exception:
-            logger.exception("text analysis failed")
-            bot.reply_to(message, "تعذر التحليل حاليًا." if lang == "ar" else "Analysis failed.")
+            logger.exception("natural-language request failed")
+            bot.reply_to(message, "تعذر تنفيذ الطلب حاليًا." if lang == "ar" else "The request could not be completed right now.")
     else:
-        bot.reply_to(message, "استخدم اسم أصل مدعوم أو أحد الأوامر." if lang == "ar" else "Use a supported asset name or a command.")
+        bot.reply_to(message, "اذكر اسم الأصل مثل الذهب أو BTC أو AAPL، أو اكتب سؤالك مع اسم الأصل." if lang == "ar" else "Mention an asset such as gold, BTC, or AAPL with your question.")
 
 
 def alert_loop():
@@ -337,6 +415,45 @@ def admin_stats():
     if not authorized():
         return jsonify({"error": "unauthorized"}), 401
     return jsonify(db.stats())
+
+
+@app.get("/admin/users")
+def admin_users():
+    if not authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify([
+        {
+            "chat_id": user.chat_id,
+            "username": user.username,
+            "language": user.language,
+            "role": user.role,
+            "is_active": user.is_active,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        }
+        for user in db.list_users()
+    ])
+
+
+@app.post("/admin/users/<int:chat_id>/role")
+def admin_user_role(chat_id: int):
+    if not authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    try:
+        role = str(payload.get("role", "")).lower()
+        ok = db.set_user_role(chat_id, role)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"updated": ok, "chat_id": chat_id, "role": role})
+
+
+@app.post("/admin/users/<int:chat_id>/active")
+def admin_user_active(chat_id: int):
+    if not authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    ok = db.set_user_active(chat_id, bool(payload.get("active", True)))
+    return jsonify({"updated": ok, "chat_id": chat_id, "active": bool(payload.get("active", True))})
 
 
 @app.get("/admin")
