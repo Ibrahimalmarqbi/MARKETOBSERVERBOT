@@ -15,32 +15,40 @@ class UserRequest:
     timeframe: str | None
 
 
+def normalize_text(text: str) -> str:
+    value = (text or "").strip().lower()
+    value = value.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    value = value.replace("ى", "ي").replace("ة", "ه")
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
 def detect_language(text: str) -> str:
     return "ar" if re.search(r"[\u0600-\u06ff]", text or "") else "en"
 
 
 def _timeframe(text: str) -> str | None:
-    lowered = (text or "").lower()
-    if re.search(r"\b(15m|15min|ربع ساعة|15 دقيق)\b", lowered):
+    lowered = normalize_text(text)
+    if re.search(r"\b(15m|15min|ربع ساعه|15 دقيقه)\b", lowered):
         return "15m"
-    if re.search(r"\b(1h|hour|ساعة|ساعه)\b", lowered):
+    if re.search(r"\b(1h|hour|ساعة|ساعه|ساعي)\b", lowered):
         return "1h"
     if re.search(r"\b(4h|4 ساعات|اربع ساعات)\b", lowered):
         return "4h"
-    if re.search(r"\b(1d|daily|day|يومي|اليوم)\b", lowered):
+    if re.search(r"\b(1d|daily|day|يومي|اليوم|يوم)\b", lowered):
         return "1d"
     return None
 
 
 def _intent(text: str) -> str:
-    lowered = (text or "").lower()
-    if re.search(r"(نبه|تنبيه|alert|notify|راقب)", lowered):
+    lowered = normalize_text(text)
+    if re.search(r"(نبه|تنبيه|اشعار|راقب|alert|notify|watch)", lowered):
         return "alert"
-    if re.search(r"(مخاطر|مخاطرة|risk|حجم الصفقة|position size|وقف الخسارة)", lowered):
+    if re.search(r"(مخاطر|مخاطره|risk|حجم الصفقه|حجم|position size|وقف الخساره|راس المال|رأس المال)", lowered):
         return "risk"
     if re.search(r"(شارت|رسم|chart|graph)", lowered):
         return "chart"
-    if re.search(r"(ادخل|أدخل|دخول|شراء|اشتر|buy|entry|enter|sell|بيع|اخرج|خروج|exit|أبيع)", lowered):
+    if re.search(r"(انصح|تنصح|نصيحه|رأيك|رايك|مناسب|ادخل|دخول|شراء|اشتر|buy|entry|enter|sell|بيع|اخرج|خروج|exit|أبيع|ابيع|الوقت المناسب)", lowered):
         return "advice"
     if re.search(r"(لماذا|ليش|اشرح|سبب|why|explain|تحليل|حلل|وضع|اتجاه|analysis|trend)", lowered):
         return "analysis"
