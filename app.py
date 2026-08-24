@@ -76,28 +76,83 @@ def get_analysis(asset: Asset) -> tuple[Analysis, list]:
     return analyze(candles, asset.price_decimals), candles
 
 
+def extract_numbers(text: str) -> list[float]:
+    normalized = (text or "").replace(",", "")
+    normalized = normalized.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    return [float(value) for value in re.findall(r"(?<![A-Za-z])[+-]?\d+(?:\.\d+)?", normalized)]
+
+
+def risk_text(result, lang: str) -> str:
+    if lang == "ar":
+        return (
+            "🛡️ حساب المخاطرة النظري\n"
+            f"مبلغ المخاطرة: {result.risk_amount} USD\n"
+            f"مسافة وقف الخسارة: {result.stop_distance}\n"
+            f"الكمية النظرية: {result.quantity}\n"
+            f"القيمة الاسمية: {result.notional} USD\n"
+            "هذه نتيجة حسابية وليست توصية بحجم صفقة حقيقية."
+        )
+    return (
+        "🛡️ Theoretical risk calculation\n"
+        f"Risk amount: {result.risk_amount} USD\n"
+        f"Stop distance: {result.stop_distance}\n"
+        f"Theoretical quantity: {result.quantity}\n"
+        f"Notional value: {result.notional} USD\n"
+        "This is a calculation, not a recommendation to use a real position size."
+    )
+
+
+def natural_risk_response(message: types.Message, lang: str, text: str):
+    numbers = extract_numbers(text)
+    if len(numbers) < 4:
+        bot.reply_to(message, "أرسل رأس المال ونسبة المخاطرة وسعر الدخول ووقف الخسارة، مثل: احسب مخاطرة رأس مال 10000 بنسبة 1% دخول 4715 وقف 4690." if lang == "ar" else "Provide capital, risk percent, entry, and stop, for example: calculate risk for 10000 capital, 1%, entry 4715, stop 4690.")
+        return
+    capital, risk_pct, entry, stop = numbers[:4]
+    point_value = numbers[4] if len(numbers) >= 5 else 1.0
+    try:
+        result = calculate_position_size(capital, risk_pct, entry, stop, point_value, settings.max_risk_percent, settings.max_position_notional)
+        bot.reply_to(message, risk_text(result, lang))
+    except ValueError:
+        bot.reply_to(message, "قيم المخاطرة غير صحيحة. تأكد من أن رأس المال والأسعار موجبة وأن نسبة المخاطرة ضمن الحد المسموح." if lang == "ar" else "Invalid risk values. Check positive capital/prices and the permitted risk limit.")
+
+
+def format_timestamp(value, lang: str) -> str:
+    try:
+        from datetime import datetime, timezone
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        value = value.astimezone(timezone.utc)
+        return value.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(value).replace("`", "")
+
+
 def analysis_text(asset: Asset, result: Analysis, lang: str) -> str:
     trend_ar = {"bullish": "صاعد", "bearish": "هابط", "sideways": "جانبي"}[result.trend]
     signal_ar = {"watch_long": "مراقبة شراء محتملة", "watch_short": "مراقبة بيع محتملة", "neutral": "محايد"}[result.signal]
+    source = market.last_source(asset.key) or ("غير معروف" if lang == "ar" else "unknown")
+    timestamp = format_timestamp(result.candle_time, lang)
     if lang == "ar":
         return (
-            f"📊 **تحليل {asset.name_ar} ({asset.key})**\n\n"
-            f"السعر: **{result.price} {asset.quote}**\nRSI: **{result.rsi}**\n"
+            f"📊 تحليل {asset.name_ar} ({asset.key})\n\n"
+            f"السعر: {result.price} {asset.quote}\nRSI: {result.rsi}\n"
             f"SMA20: {result.sma20} | SMA50: {result.sma50}\nATR14: {result.atr14}\n"
-            f"الدعم التاريخي القريب: {result.support}\nالمقاومة التاريخية القريبة: {result.resistance}\n"
-            f"الاتجاه: **{trend_ar}**\nالحالة: **{signal_ar}**\n\n"
-            f"وقت آخر شمعة: `{result.candle_time}`\nعدد الشموع: `{result.data_points}`\n"
-            f"مصدر البيانات: `{market.last_source(asset.key) or 'unknown'}`\n"
+            f"الدعم القريب: {result.support}\nالمقاومة القريبة: {result.resistance}\n"
+            f"الاتجاه: {trend_ar}\nالحالة: {signal_ar}\n\n"
+            f"آخر شمعة: {timestamp}\nعدد الشموع: {result.data_points}\n"
+            f"مصدر البيانات: {source}\n"
             "هذه قراءة آلية للمؤشرات وليست ضمانًا للربح أو توصية شخصية."
         )
     return (
-        f"📊 **{asset.name_en} analysis ({asset.key})**\n\n"
-        f"Price: **{result.price} {asset.quote}**\nRSI: **{result.rsi}**\n"
+        f"📊 {asset.name_en} analysis ({asset.key})\n\n"
+        f"Price: {result.price} {asset.quote}\nRSI: {result.rsi}\n"
         f"SMA20: {result.sma20} | SMA50: {result.sma50}\nATR14: {result.atr14}\n"
-        f"Recent historical support: {result.support}\nRecent historical resistance: {result.resistance}\n"
-        f"Trend: **{result.trend}**\nState: **{result.signal}**\n\n"
-        f"Last candle: `{result.candle_time}`\nCandles: `{result.data_points}`\n"
-        f"Data source: `{market.last_source(asset.key) or 'unknown'}`\n"
+        f"Nearby support: {result.support}\nNearby resistance: {result.resistance}\n"
+        f"Trend: {result.trend}\nState: {result.signal}\n\n"
+        f"Last candle: {timestamp}\nCandles: {result.data_points}\n"
+        f"Data source: {source}\n"
         "This is automated indicator analysis, not a guarantee or personalized advice."
     )
 
@@ -124,7 +179,7 @@ def advice_text(advice: Advice, lang: str) -> str:
             f"المصدر: {advice.source or 'غير معروف'} | آخر تحديث: {advice.as_of}",
             "هذه سيناريوهات مشروطة وليست ضمانًا أو توصية شخصية. لا تدخل دون تحديد رأس المال والمخاطرة ووقف الخسارة.",
         ]
-        return "\\n".join(lines)
+        return "\n".join(lines)
     action = {"watch_long": "Conditional long watch", "watch_short": "Conditional short watch", "wait": "Wait"}[advice.action]
     lines = [
         f"Decision assistant: {advice.asset.name_en} ({advice.asset.key})",
@@ -145,7 +200,7 @@ def advice_text(advice: Advice, lang: str) -> str:
         f"Source: {advice.source or 'unknown'} | last update: {advice.as_of}",
         "These are conditional scenarios, not a guarantee or personalized advice. Define capital, risk, and a stop before acting.",
     ]
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def chart(asset: Asset, candles: list) -> io.BytesIO:
@@ -165,7 +220,7 @@ def chart(asset: Asset, candles: list) -> io.BytesIO:
 
 
 def send_localized(chat_id: int, lang: str, ar: str, en: str):
-    bot.send_message(chat_id, ar if lang == "ar" else en, parse_mode="Markdown")
+    bot.send_message(chat_id, ar if lang == "ar" else en)
 
 
 @bot.message_handler(commands=["start", "help"])
@@ -184,7 +239,7 @@ def analyze_cmd(message: types.Message):
         return
     try:
         result, _ = get_analysis(asset)
-        bot.reply_to(message, analysis_text(asset, result, user_language(message)), parse_mode="Markdown")
+        bot.reply_to(message, analysis_text(asset, result, user_language(message)))
     except DataUnavailable:
         bot.reply_to(message, AR["data_error"] if user_language(message) == "ar" else "Reliable market data is unavailable right now. No synthetic data was used.")
     except Exception:
@@ -315,6 +370,9 @@ def text_cmd(message: types.Message):
     asset = request.asset
     remember_user(message, asset)
     lang = request.language
+    if request.intent == "risk":
+        natural_risk_response(message, lang, text)
+        return
     if asset:
         try:
             if request.intent == "advice":
