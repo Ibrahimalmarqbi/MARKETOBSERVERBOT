@@ -156,10 +156,27 @@ class Database:
             s.flush()
             return trade
 
+    def set_user_role(self, chat_id: int, role: str) -> bool:
+        if role not in {"user", "analyst", "admin"}:
+            raise ValueError("Unsupported role")
+        with self.session() as s:
+            result = s.execute(update(User).where(User.chat_id == chat_id).values(role=role, updated_at=utcnow()))
+            return result.rowcount == 1
+
+    def set_user_active(self, chat_id: int, active: bool) -> bool:
+        with self.session() as s:
+            result = s.execute(update(User).where(User.chat_id == chat_id).values(is_active=active, updated_at=utcnow()))
+            return result.rowcount == 1
+
+    def list_users(self, limit: int = 100) -> list[User]:
+        with self.session() as s:
+            return list(s.scalars(select(User).order_by(User.created_at.desc()).limit(limit)).all())
+
     def stats(self) -> dict[str, int]:
         with self.session() as s:
             return {
                 "users": len(s.scalars(select(User.id)).all()),
+                "active_users": len(s.scalars(select(User.id).where(User.is_active.is_(True))).all()),
                 "active_alerts": len(s.scalars(select(Alert.id).where(Alert.status == "active")).all()),
                 "trades": len(s.scalars(select(Trade.id)).all()),
             }
