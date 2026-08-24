@@ -16,6 +16,9 @@ class Settings:
     max_position_notional: float
     allow_live_trading: bool
     port: int
+    llm_api_key: str
+    llm_api_base: str
+    llm_model: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -43,4 +46,7 @@ class Settings:
             max_position_notional=float(os.getenv("MAX_POSITION_NOTIONAL", "10000")),
             allow_live_trading=os.getenv("ALLOW_LIVE_TRADING", "false").lower() in {"1", "true", "yes", "on"},
             port=int(os.getenv("PORT", "10000")),
+            llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
+            llm_api_base=os.getenv("LLM_API_BASE", "https://api.openai.com/v1").strip(),
+            llm_model=os.getenv("LLM_MODEL", "gpt-5-mini").strip(),
         )
