@@ -1,8 +1,8 @@
-pyTelegramBotAPI
-google-generativeai
-yfinance
-pandas
-schedule
-flask
-requests
-matplotlib
+Flask>=3.0,<4
+PyTelegramBotAPI>=4.24,<5
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.1,<4
+requests>=2.31,<3
+yfinance>=0.2.40,<1
+matplotlib>=3.8,<4
+pandas>=2.0,<3
