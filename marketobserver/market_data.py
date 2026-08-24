@@ -45,11 +45,11 @@ class MarketDataProvider:
                 self._source[asset.key] = cached[2]
                 return cached[1]
 
-        source = "yahoo"
+        source = f"yahoo:{asset.provider_symbol}"
         if asset.asset_class == "crypto":
             candles = self._binance(asset, interval, limit)
             if candles:
-                source = "binance"
+                source = f"binance:{self._binance_pair(asset)}"
             else:
                 candles = self._yahoo(asset, interval, limit)
         else:
@@ -65,8 +65,11 @@ class MarketDataProvider:
     def last_source(self, asset_key: str) -> str | None:
         return self._source.get(asset_key)
 
+    def _binance_pair(self, asset: Asset) -> str | None:
+        return {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "PAXG": "PAXGUSDT"}.get(asset.key)
+
     def _binance(self, asset: Asset, interval: str, limit: int) -> list[Candle]:
-        pair = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "PAXG": "PAXGUSDT"}.get(asset.key)
+        pair = self._binance_pair(asset)
         if not pair:
             return []
         try:
