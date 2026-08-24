@@ -23,3 +23,9 @@ services:
         value: "10000"
       - key: ALLOW_LIVE_TRADING
         value: "false"
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_API_BASE
+        value: https://api.openai.com/v1
+      - key: LLM_MODEL
+        value: gpt-5-mini
