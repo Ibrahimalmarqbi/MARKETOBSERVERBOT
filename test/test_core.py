@@ -7,6 +7,7 @@ from marketobserver.assets import resolve_asset
 from marketobserver.db import Database
 from marketobserver.market_data import Candle
 from marketobserver.risk import calculate_position_size
+from marketobserver.nlp import parse_request
 
 
 def candle(value: float, index: int) -> Candle:
@@ -35,6 +36,20 @@ def test_risk_is_capped_and_validated():
     assert result.notional == 500
     with pytest.raises(ValueError):
         calculate_position_size(10000, 3, 100, 90, max_risk_percent=2)
+
+
+def test_natural_language_request_is_multilingual():
+    request = parse_request("متى الوقت المناسب للدخول في الذهب؟")
+    assert request.language == "ar"
+    assert request.intent == "advice"
+    assert request.asset.key == "XAUUSD"
+
+
+def test_english_natural_language_request():
+    request = parse_request("Should I buy BTC now?")
+    assert request.language == "en"
+    assert request.intent == "advice"
+    assert request.asset.key == "BTC"
 
 
 def test_alerts_are_scoped_to_user(tmp_path):
