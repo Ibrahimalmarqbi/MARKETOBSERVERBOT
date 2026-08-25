@@ -6,6 +6,8 @@ import re
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import matplotlib
 matplotlib.use("Agg")
@@ -37,6 +39,7 @@ research = MarketResearch()
 llm = GroundedLLM(settings.llm_api_key, settings.llm_api_base, settings.llm_model)
 paper_broker = PaperBroker()
 live_broker = LiveBrokerNotConfigured()
+last_signal_scan_at = 0.0
 bot = telebot.TeleBot(settings.telegram_token, threaded=True)
 app = Flask(__name__)
 
@@ -210,24 +213,32 @@ def natural_risk_response(message: types.Message, lang: str, text: str):
         bot.reply_to(message, "قيم المخاطرة غير صحيحة. تأكد من أن رأس المال والأسعار موجبة وأن نسبة المخاطرة ضمن الحد المسموح." if lang == "ar" else "Invalid risk values. Check positive capital/prices and the permitted risk limit.")
 
 
-def format_timestamp(value, lang: str) -> str:
+def user_timezone(message: types.Message) -> str:
+    user = db.get_user(message.chat.id)
+    return getattr(user, "tz_name", None) or "Asia/Riyadh"
+
+
+def format_timestamp(value, lang: str, tz_name: str = "Asia/Riyadh") -> str:
     try:
-        from datetime import datetime, timezone
         if isinstance(value, str):
             value = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
-        value = value.astimezone(timezone.utc)
-        return value.strftime("%Y-%m-%d %H:%M UTC")
+        try:
+            local = value.astimezone(ZoneInfo(tz_name))
+        except ZoneInfoNotFoundError:
+            local = value.astimezone(ZoneInfo("Asia/Riyadh"))
+        zone_label = local.tzname() or tz_name
+        return local.strftime("%Y-%m-%d %H:%M") + f" {zone_label}"
     except Exception:
         return str(value).replace("`", "")
 
 
-def analysis_text(asset: Asset, result: Analysis, lang: str) -> str:
+def analysis_text(asset: Asset, result: Analysis, lang: str, tz_name: str = "Asia/Riyadh") -> str:
     trend_ar = {"bullish": "صاعد", "bearish": "هابط", "sideways": "جانبي"}[result.trend]
     signal_ar = {"watch_long": "مراقبة شراء محتملة", "watch_short": "مراقبة بيع محتملة", "neutral": "محايد"}[result.signal]
     source = market.last_source(asset.key) or ("غير معروف" if lang == "ar" else "unknown")
-    timestamp = format_timestamp(result.candle_time, lang)
+    timestamp = format_timestamp(result.candle_time, lang, tz_name)
     if lang == "ar":
         return (
             f"📊 تحليل {asset.name_ar} ({asset.key})\n\n"
@@ -271,7 +282,7 @@ def translate_advice_reason(reason: str, lang: str) -> str:
     return translated
 
 
-def advice_text(advice: Advice, lang: str) -> str:
+def advice_text(advice: Advice, lang: str, tz_name: str = "Asia/Riyadh") -> str:
     if lang == "ar":
         action = {"watch_long": "مراقبة شراء مشروطة", "watch_short": "مراقبة بيع مشروطة", "wait": "انتظار"}[advice.action]
         confidence = {"low": "منخفضة", "medium": "متوسطة", "high": "مرتفعة"}.get(advice.confidence, advice.confidence)
@@ -291,7 +302,7 @@ def advice_text(advice: Advice, lang: str) -> str:
             ]
         lines += [
             "الأطر المستخدمة: " + ", ".join(view.timeframe for view in advice.views),
-            f"المصدر: {advice.source or 'غير معروف'} | آخر تحديث: {format_timestamp(advice.as_of, lang)}",
+            f"المصدر: {advice.source or 'غير معروف'} | آخر تحديث: {format_timestamp(advice.as_of, lang, tz_name)}",
             "هذه سيناريوهات مشروطة وليست ضمانًا أو توصية شخصية. لا تدخل دون تحديد رأس المال والمخاطرة ووقف الخسارة.",
         ]
         return "\n".join(lines)
@@ -312,7 +323,7 @@ def advice_text(advice: Advice, lang: str) -> str:
         ]
     lines += [
         "Timeframes: " + ", ".join(view.timeframe for view in advice.views),
-        f"Source: {advice.source or 'unknown'} | last update: {format_timestamp(advice.as_of, lang)}",
+        f"Source: {advice.source or 'unknown'} | last update: {format_timestamp(advice.as_of, lang, tz_name)}",
         "These are conditional scenarios, not a guarantee or personalized advice. Define capital, risk, and a stop before acting.",
     ]
     return "\n".join(lines)
@@ -344,6 +355,75 @@ def start_cmd(message: types.Message):
     bot.reply_to(message, AR["start"] if user_language(message) == "ar" else "Welcome. Use /analyze BTC, /alert below BTC 60000, /risk, and /paperbuy for paper trading.")
 
 
+def signal_text(rows, lang: str, tz_name: str) -> str:
+    now = format_timestamp(datetime.now(timezone.utc), lang, tz_name)
+    if lang == "ar":
+        lines = ["🔔 إشارات مراقبة تلقائية", f"وقت الفحص: {now}", "هذه إشارات بحثية مشروطة وليست أوامر شراء أو بيع:"]
+        for asset, result in rows:
+            direction = "مراقبة صعود" if result.signal == "watch_long" else "مراقبة هبوط"
+            lines.append(f"{asset.name_ar} ({asset.key}) — {direction} | السعر {result.price} | RSI {result.rsi} | الاتجاه {result.trend}")
+        lines.append("تحقق من التحليل متعدد الأطر وحدد وقف الخسارة قبل أي قرار.")
+        return "\n".join(lines)
+    lines = ["🔔 Automatic watch signals", f"Scan time: {now}", "These are conditional research signals, not buy or sell orders:"]
+    for asset, result in rows:
+        direction = "upside watch" if result.signal == "watch_long" else "downside watch"
+        lines.append(f"{asset.name_en} ({asset.key}) — {direction} | price {result.price} | RSI {result.rsi} | trend {result.trend}")
+    lines.append("Verify multi-timeframe analysis and define a stop before acting.")
+    return "\n".join(lines)
+
+
+def scan_signal_candidates(limit: int = 3):
+    rows = []
+    for asset in list(ASSETS.values())[:12]:
+        try:
+            result, _ = get_analysis(asset)
+            if result.signal in {"watch_long", "watch_short"}:
+                strength = (2 if result.trend in {"bullish", "bearish"} else 0) + (1 if result.rsi is not None and 35 < result.rsi < 70 else 0)
+                rows.append((strength, asset, result))
+        except (DataUnavailable, ValueError, TypeError):
+            continue
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return [(asset, result) for _, asset, result in rows[:limit]]
+
+
+@bot.message_handler(commands=["signals"])
+def signals_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    parts = message.text.split()
+    if len(parts) == 1:
+        user = db.get_user(message.chat.id)
+        enabled = bool(user and user.signals_enabled)
+        bot.reply_to(message, (f"المراقبة التلقائية: {'مفعلة' if enabled else 'متوقفة'}. استخدم /signals on أو /signals off." if lang == "ar" else f"Automatic signal monitoring: {'on' if enabled else 'off'}. Use /signals on or /signals off."))
+        return
+    value = parts[1].lower()
+    if value not in {"on", "off", "تشغيل", "ايقاف", "إيقاف"}:
+        bot.reply_to(message, "الاستخدام: /signals on أو /signals off" if lang == "ar" else "Usage: /signals on or /signals off")
+        return
+    enabled = value in {"on", "تشغيل"}
+    db.set_signals_enabled(message.chat.id, enabled)
+    bot.reply_to(message, "تم تفعيل المراقبة التلقائية." if enabled and lang == "ar" else "تم إيقاف المراقبة التلقائية." if lang == "ar" else "Automatic signal monitoring enabled." if enabled else "Automatic signal monitoring disabled.")
+
+
+@bot.message_handler(commands=["timezone"])
+def timezone_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    parts = message.text.split(maxsplit=1)
+    if len(parts) == 1:
+        current = user_timezone(message)
+        bot.reply_to(message, f"منطقتك الزمنية الحالية: {current}. غيّرها مثلًا: /timezone Asia/Riyadh" if lang == "ar" else f"Your current timezone is {current}. Change it with /timezone Asia/Riyadh")
+        return
+    tz_name = parts[1].strip()
+    try:
+        ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        bot.reply_to(message, "المنطقة الزمنية غير صحيحة. استخدم اسمًا مثل Asia/Riyadh أو Asia/Dubai أو Europe/London." if lang == "ar" else "Unknown timezone. Use a name such as Asia/Riyadh, Asia/Dubai, or Europe/London.")
+        return
+    db.set_timezone(message.chat.id, tz_name)
+    bot.reply_to(message, f"تم ضبط التوقيت على {tz_name}." if lang == "ar" else f"Timezone set to {tz_name}.")
+
+
 @bot.message_handler(commands=["analyze"])
 def analyze_cmd(message: types.Message):
     parts = message.text.split(maxsplit=1)
@@ -354,7 +434,7 @@ def analyze_cmd(message: types.Message):
         return
     try:
         result, _ = get_analysis(asset)
-        bot.reply_to(message, analysis_text(asset, result, user_language(message)))
+        bot.reply_to(message, analysis_text(asset, result, user_language(message), user_timezone(message)))
     except DataUnavailable:
         bot.reply_to(message, AR["data_error"] if user_language(message) == "ar" else "Reliable market data is unavailable right now. No synthetic data was used.")
     except Exception:
@@ -530,10 +610,10 @@ def text_cmd(message: types.Message):
                         return
                     except Exception:
                         logger.exception("grounded LLM explanation failed; using deterministic response")
-                bot.reply_to(message, advice_text(advice, lang))
+                bot.reply_to(message, advice_text(advice, lang, user_timezone(message)))
             else:
                 result, _ = get_analysis(asset)
-                bot.reply_to(message, analysis_text(asset, result, lang))
+                bot.reply_to(message, analysis_text(asset, result, lang, user_timezone(message)))
         except DataUnavailable:
             bot.reply_to(message, AR["data_error"] if lang == "ar" else "Reliable market data is unavailable right now. No synthetic data was used.")
         except Exception:
@@ -544,6 +624,7 @@ def text_cmd(message: types.Message):
 
 
 def alert_loop():
+    global last_signal_scan_at
     while True:
         try:
             active = db.active_alerts()
@@ -580,6 +661,20 @@ def alert_loop():
                         db.trigger_alert(alert.id)
                     except Exception:
                         logger.exception("alert delivery failed id=%s", alert.id)
+            now = time.time()
+            if now - last_signal_scan_at >= settings.signal_scan_seconds:
+                rows = scan_signal_candidates()
+                if rows:
+                    current_utc = datetime.now(timezone.utc)
+                    for user in db.signal_users():
+                        if user.signal_cooldown_until and user.signal_cooldown_until > current_utc:
+                            continue
+                        try:
+                            bot.send_message(user.chat_id, signal_text(rows, user.language, user.tz_name))
+                            db.set_signal_cooldown(user.chat_id, current_utc + timedelta(hours=1))
+                        except Exception:
+                            logger.exception("signal delivery failed chat_id=%s", user.chat_id)
+                last_signal_scan_at = now
         except Exception:
             logger.exception("alert loop failure")
         time.sleep(settings.alert_poll_seconds)
