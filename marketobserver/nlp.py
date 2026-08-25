@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import re
@@ -43,13 +42,19 @@ def _timeframe(text: str) -> str | None:
 
 def _intent(text: str) -> str:
     lowered = normalize_text(text)
+    if re.search(r"(من انت|من انت؟|من مطورك|من صنعك|مين انت|who are you|your developer|developer|مساعده|مساعده|help|مرحبا|اهلا|السلام عليكم|شكرا|thanks|thank you|hello|hi)", lowered):
+        return "general"
+    if re.search(r"(افضل اصل|أفضل اصل|افضل عمله|أفضل عملة|افضل سهم|أفضل سهم|ماذا اشتري|وش اشتري|what should i buy|best asset|best coin|best stock|rank|ترتيب)", lowered):
+        return "rank"
+    if re.search(r"(خبر|اخبار|أخبار|news|headline|sentiment|مشاعر السوق|معنويات)", lowered):
+        return "news"
     if re.search(r"(نبه|تنبيه|اشعار|راقب|alert|notify|watch)", lowered):
         return "alert"
     if re.search(r"(مخاطر|مخاطره|risk|حجم الصفقه|حجم|position size|وقف الخساره|راس المال|رأس المال)", lowered):
         return "risk"
     if re.search(r"(شارت|رسم|chart|graph)", lowered):
         return "chart"
-    if re.search(r"(انصح|تنصح|نصيحه|رأيك|رايك|مناسب|ادخل|دخول|شراء|اشتر|buy|entry|enter|sell|بيع|اخرج|خروج|exit|أبيع|ابيع|الوقت المناسب)", lowered):
+    if re.search(r"(انصح|تنصح|نصيحه|رايك|مناسب|ادخل|دخول|شراء|اشتر|buy|entry|enter|sell|بيع|اخرج|خروج|exit|ابيع|الوقت المناسب)", lowered):
         return "advice"
     if re.search(r"(لماذا|ليش|اشرح|سبب|why|explain|تحليل|حلل|وضع|اتجاه|analysis|trend)", lowered):
         return "analysis"
@@ -57,12 +62,13 @@ def _intent(text: str) -> str:
 
 
 def parse_request(text: str, last_asset_key: str | None = None) -> UserRequest:
+    intent = _intent(text)
     asset = resolve_asset(text)
-    if asset is None and last_asset_key:
+    if asset is None and last_asset_key and intent in {"analysis", "advice", "chart", "news"}:
         asset = resolve_asset(last_asset_key)
     return UserRequest(
         raw_text=text or "",
-        intent=_intent(text),
+        intent=intent,
         language=detect_language(text),
         asset=asset,
         timeframe=_timeframe(text),
