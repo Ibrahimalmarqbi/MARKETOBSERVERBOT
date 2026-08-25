@@ -40,13 +40,21 @@ app = Flask(__name__)
 
 
 AR = {
-    "start": "أهلًا بك في MarketObserver Pro. استخدم /analyze BTC للتحليل، /alert below BTC 60000 للتنبيه، /risk لحساب الحجم النظري، و /paperbuy لتجربة صفقة محاكاة.",
-    "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي.",
-    "unknown_asset": "الأصل غير مدعوم. جرّب BTC أو ETH أو SOL أو XAUUSD أو EURUSD أو AAPL أو TSLA أو NVDA.",
+    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، هل أدخل البيتكوين؟ أو احسب مخاطرة رأس المال 10000 بنسبة 1% دخول 4715 وقف 4690. يمكنك أيضًا استخدام /analyze و /alert و /risk و /paperbuy.",
+    "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
 }
 
 
+def unknown_asset_text(lang: str) -> str:
+    examples = "BTC, ETH, SOL, XAUUSD, XAGUSD, EURUSD, WTI, BRENT, GASOLINE, NATGAS, AAPL, TSLA, NVDA"
+    return ("لم أتعرف على الأصل. اكتب اسمًا أو رمزًا واضحًا، مثل: الذهب، الفضة، برنت، البنزين، BTC، EURUSD، أو AAPL."
+            if lang == "ar" else f"I could not identify the asset. Use a clear name or ticker, for example: {examples}.")
+
+
 def user_language(message: types.Message) -> str:
+    text = getattr(message, "text", "") or ""
+    if re.search(r"[\u0600-\u06ff]", text):
+        return "ar"
     code = getattr(getattr(message, "from_user", None), "language_code", "") or ""
     return "ar" if code.lower().startswith("ar") else "en"
 
@@ -256,7 +264,7 @@ def analyze_cmd(message: types.Message):
     asset = selected_asset(message, parts[1] if len(parts) == 2 else None)
     remember_user(message, asset)
     if not asset:
-        bot.reply_to(message, AR["unknown_asset"])
+        bot.reply_to(message, unknown_asset_text(user_language(message)))
         return
     try:
         result, _ = get_analysis(asset)
@@ -274,7 +282,7 @@ def chart_cmd(message: types.Message):
     asset = selected_asset(message, parts[1] if len(parts) == 2 else None)
     remember_user(message, asset)
     if not asset:
-        bot.reply_to(message, AR["unknown_asset"])
+        bot.reply_to(message, unknown_asset_text(user_language(message)))
         return
     try:
         result, candles = get_analysis(asset)
