@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from contextlib import contextmanager
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, update, delete, Index
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, update, delete, Index, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -23,6 +23,9 @@ class User(Base):
     last_asset: Mapped[str] = mapped_column(String(30), default="BTC")
     role: Mapped[str] = mapped_column(String(20), default="user")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    tz_name: Mapped[str] = mapped_column(String(64), default="Asia/Riyadh")
+    signals_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    signal_cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -80,6 +83,21 @@ class Database:
 
     def create_all(self) -> None:
         Base.metadata.create_all(self.engine)
+        # create_all does not add new columns to an existing table; migrate the
+        # small user preference explicitly for existing Render databases.
+        columns = {column["name"] for column in inspect(self.engine).get_columns("users")}
+        missing = []
+        if "tz_name" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN tz_name VARCHAR(64) DEFAULT 'Asia/Riyadh'")
+        if "signals_enabled" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN signals_enabled BOOLEAN DEFAULT FALSE")
+        if "signal_cooldown_until" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN signal_cooldown_until TIMESTAMP NULL")
+        if missing:
+            with self.engine.begin() as connection:
+                for statement in missing:
+                    connection.execute(text(statement))
+
 
     @contextmanager
     def session(self):
@@ -115,6 +133,22 @@ class Database:
     def set_last_asset(self, chat_id: int, asset_key: str) -> None:
         with self.session() as s:
             s.execute(update(User).where(User.chat_id == chat_id).values(last_asset=asset_key, updated_at=utcnow()))
+
+    def set_timezone(self, chat_id: int, tz_name: str) -> None:
+        with self.session() as s:
+            s.execute(update(User).where(User.chat_id == chat_id).values(tz_name=tz_name, updated_at=utcnow()))
+
+    def set_signals_enabled(self, chat_id: int, enabled: bool) -> None:
+        with self.session() as s:
+            s.execute(update(User).where(User.chat_id == chat_id).values(signals_enabled=enabled, updated_at=utcnow()))
+
+    def signal_users(self) -> list[User]:
+        with self.session() as s:
+            return list(s.scalars(select(User).where(User.is_active.is_(True), User.signals_enabled.is_(True))).all())
+
+    def set_signal_cooldown(self, chat_id: int, until: datetime) -> None:
+        with self.session() as s:
+            s.execute(update(User).where(User.chat_id == chat_id).values(signal_cooldown_until=until, updated_at=utcnow()))
 
     def add_alert(self, chat_id: int, asset_key: str, target_price: float, condition: str) -> Alert:
         with self.session() as s:
