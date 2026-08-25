@@ -22,6 +22,7 @@ from marketobserver.broker import LiveBrokerNotConfigured, OrderRequest, PaperBr
 from marketobserver.config import Settings
 from marketobserver.db import Database
 from marketobserver.market_data import DataUnavailable, MarketDataProvider
+from marketobserver.research import MarketResearch, ResearchSnapshot
 from marketobserver.risk import calculate_position_size
 from marketobserver.llm import GroundedLLM
 
@@ -32,6 +33,7 @@ settings = Settings.from_env()
 db = Database(settings.database_url)
 db.create_all()
 market = MarketDataProvider()
+research = MarketResearch()
 llm = GroundedLLM(settings.llm_api_key, settings.llm_api_base, settings.llm_model)
 paper_broker = PaperBroker()
 live_broker = LiveBrokerNotConfigured()
@@ -49,6 +51,90 @@ def unknown_asset_text(lang: str) -> str:
     examples = "BTC, ETH, SOL, XAUUSD, XAGUSD, EURUSD, WTI, BRENT, GASOLINE, NATGAS, AAPL, TSLA, NVDA"
     return ("لم أتعرف على الأصل. اكتب اسمًا أو رمزًا واضحًا، مثل: الذهب، الفضة، برنت، البنزين، BTC، EURUSD، أو AAPL."
             if lang == "ar" else f"I could not identify the asset. Use a clear name or ticker, for example: {examples}.")
+
+
+def news_text(snapshot: ResearchSnapshot, lang: str) -> str:
+    if not snapshot.items:
+        return (f"لا توجد عناوين موثوقة متاحة حاليًا لـ {snapshot.asset.name_ar}. لم يتم اختلاق أخبار أو مشاعر سوقية."
+                if lang == "ar" else f"No reliable headlines are available for {snapshot.asset.name_en} right now. No news or sentiment was invented.")
+    if lang == "ar":
+        lines = [
+            f"📰 أخبار {snapshot.asset.name_ar} ({snapshot.asset.key})",
+            f"المشاعر التقريبية للعناوين: إيجابي {snapshot.positive} | سلبي {snapshot.negative} | محايد {snapshot.neutral}",
+            f"المصدر: {snapshot.source} | وقت الجمع: {snapshot.as_of}",
+            "",
+        ]
+        for item in snapshot.items:
+            label = {"positive": "إيجابي", "negative": "سلبي", "neutral": "محايد"}[item.sentiment]
+            lines.append(f"[{label}] {item.title}")
+        lines.append("تصنيف المشاعر آلي وتقريبي للعناوين، وليس قياسًا شاملاً لمشاعر السوق.")
+        return "\n".join(lines)
+    lines = [
+        f"📰 {snapshot.asset.name_en} news ({snapshot.asset.key})",
+        f"Headline sentiment: positive {snapshot.positive} | negative {snapshot.negative} | neutral {snapshot.neutral}",
+        f"Source: {snapshot.source} | collected: {snapshot.as_of}",
+        "",
+    ]
+    for item in snapshot.items:
+        lines.append(f"[{item.sentiment}] {item.title}")
+    lines.append("Headline sentiment is automated and approximate, not a complete measure of market sentiment.")
+    return "\n".join(lines)
+
+
+def rank_assets(lang: str) -> str:
+    candidates = [asset for asset in ASSETS.values() if asset.supported][:12]
+    ranked: list[tuple[float, Asset, Analysis, ResearchSnapshot]] = []
+    for asset in candidates:
+        try:
+            result, _ = get_analysis(asset)
+            snapshot = research.news(asset, limit=5)
+            score = 0.0
+            score += 2.0 if result.trend == "bullish" else -2.0 if result.trend == "bearish" else 0.0
+            score += 1.0 if result.signal == "watch_long" else -1.0 if result.signal == "watch_short" else 0.0
+            score += max(-1.0, min(1.0, (snapshot.positive - snapshot.negative) / 3.0))
+            if result.rsi is not None and 45 <= result.rsi <= 65:
+                score += 0.5
+            ranked.append((score, asset, result, snapshot))
+        except (DataUnavailable, ValueError, TypeError):
+            continue
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    if not ranked:
+        return ("لا أستطيع ترتيب الأصول الآن لأن بيانات السوق الموثوقة غير متاحة. لن أخمّن أو أنشئ ترتيبًا وهميًا."
+                if lang == "ar" else "I cannot rank assets because reliable market data is unavailable. I will not guess or fabricate a ranking.")
+    if lang == "ar":
+        lines = [
+            "📊 ترتيب مراقبة أولي للأصول",
+            "تم الجمع بين الاتجاه والإشارة وRSI ومشاعر عناوين الأخبار المتاحة. النتيجة ليست احتمالًا إحصائيًا ولا ضمانًا للربح.",
+            "",
+        ]
+        for index, (score, asset, result, snapshot) in enumerate(ranked[:5], 1):
+            lines.append(f"{index}. {asset.name_ar} ({asset.key}) | درجة مراقبة: {score:.2f} | الاتجاه: {result.trend} | الأخبار: +{snapshot.positive}/-{snapshot.negative}")
+        lines.append("افحص الأصل المختار بتحليل متعدد الأطر وحدد نقطة إلغاء ومخاطرة قبل أي قرار.")
+        return "\n".join(lines)
+    lines = [
+        "📊 Preliminary watch ranking",
+        "Combines trend, signal, RSI, and available headline sentiment. This is not a statistical probability or profit guarantee.",
+        "",
+    ]
+    for index, (score, asset, result, snapshot) in enumerate(ranked[:5], 1):
+        lines.append(f"{index}. {asset.name_en} ({asset.key}) | watch score: {score:.2f} | trend: {result.trend} | news: +{snapshot.positive}/-{snapshot.negative}")
+    lines.append("Inspect the selected asset with multi-timeframe analysis and define invalidation and risk before acting.")
+    return "\n".join(lines)
+
+
+def general_response(lang: str) -> str:
+    if lang == "ar":
+        return (
+            "أنا MarketObserver Pro، مساعد لتحليل الأسواق والبيانات، ومطوّري إبراهيم المرقبي. أستطيع فهم طلبات مثل: «حلل الذهب»، "
+            "«هل أدخل البيتكوين؟»، «ما أفضل أصل الآن؟»، «أظهر الأخبار»، و«احسب المخاطرة». كما أستطيع شرح RSI والاتجاه والدعم والمقاومة. "
+            "اكتب سؤالك مباشرة، وسأبحث في البيانات المتاحة وأرد باللغة نفسها."
+        )
+    return (
+        "I am MarketObserver Pro, a market-data and analysis assistant developed by Ibrahim Al-Marqbi. "
+        "I can understand requests such as 'analyze gold', 'should I enter Bitcoin?', 'what is the best asset now?', "
+        "'show the news', and 'calculate risk'. I can also explain RSI, trend, support, and resistance. "
+        "Ask directly and I will research the available data and reply in the same language."
+    )
 
 
 def user_language(message: types.Message) -> str:
@@ -399,8 +485,24 @@ def text_cmd(message: types.Message):
     asset = request.asset
     remember_user(message, asset)
     lang = request.language
+    if request.intent == "general":
+        bot.reply_to(message, general_response(lang))
+        return
+    if request.intent == "rank":
+        bot.reply_to(message, rank_assets(lang))
+        return
     if request.intent == "risk":
         natural_risk_response(message, lang, text)
+        return
+    if request.intent == "news" and asset:
+        try:
+            bot.reply_to(message, news_text(research.news(asset), lang))
+        except Exception:
+            logger.exception("news research failed")
+            bot.reply_to(message, "تعذر جلب الأخبار حاليًا." if lang == "ar" else "News research is temporarily unavailable.")
+        return
+    if request.intent == "news" and not asset:
+        bot.reply_to(message, "اكتب الأصل مع طلب الأخبار، مثل: أخبار الذهب أو مشاعر البيتكوين." if lang == "ar" else "Name the asset, for example: gold news or Bitcoin sentiment.")
         return
     if asset:
         try:
