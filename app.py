@@ -157,14 +157,35 @@ def analysis_text(asset: Asset, result: Analysis, lang: str) -> str:
     )
 
 
+def translate_advice_reason(reason: str, lang: str) -> str:
+    if lang != "ar":
+        return reason
+    translated = reason
+    translated = translated.replace(
+        "The higher and execution timeframes align bullishly, while momentum remains below an extreme zone.",
+        "الإطار الأعلى وإطار التنفيذ متوافقان باتجاه صاعد، والزخم لم يصل إلى منطقة مبالغة.",
+    )
+    translated = translated.replace(
+        "The higher and execution timeframes align bearishly, while downside momentum is not yet exhausted.",
+        "الإطار الأعلى وإطار التنفيذ متوافقان باتجاه هابط، والزخم الهابط لم يصل إلى حالة استنفاد.",
+    )
+    translated = translated.replace(
+        "The timeframes are mixed or momentum does not confirm a clean setup; waiting for confirmation is the safer state.",
+        "الأطر الزمنية متباينة أو أن الزخم لا يؤكد فرصة واضحة؛ الانتظار حتى ظهور تأكيد أوضح هو الحالة الأكثر تحفظًا.",
+    )
+    translated = translated.replace("Unavailable views:", "الأطر غير المتاحة:")
+    return translated
+
+
 def advice_text(advice: Advice, lang: str) -> str:
     if lang == "ar":
         action = {"watch_long": "مراقبة شراء مشروطة", "watch_short": "مراقبة بيع مشروطة", "wait": "انتظار"}[advice.action]
+        confidence = {"low": "منخفضة", "medium": "متوسطة", "high": "مرتفعة"}.get(advice.confidence, advice.confidence)
         lines = [
             f"مساعد القرار: {advice.asset.name_ar} ({advice.asset.key})",
             f"السعر المرجعي: {advice.current_price} {advice.asset.quote}",
-            f"الحالة: {action} | الثقة: {advice.confidence}",
-            f"السبب: {advice.reason}",
+            f"الحالة: {action} | الثقة: {confidence}",
+            f"السبب: {translate_advice_reason(advice.reason, lang)}",
         ]
         if advice.entry_low is not None:
             lines += [
@@ -176,7 +197,7 @@ def advice_text(advice: Advice, lang: str) -> str:
             ]
         lines += [
             "الأطر المستخدمة: " + ", ".join(view.timeframe for view in advice.views),
-            f"المصدر: {advice.source or 'غير معروف'} | آخر تحديث: {advice.as_of}",
+            f"المصدر: {advice.source or 'غير معروف'} | آخر تحديث: {format_timestamp(advice.as_of, lang)}",
             "هذه سيناريوهات مشروطة وليست ضمانًا أو توصية شخصية. لا تدخل دون تحديد رأس المال والمخاطرة ووقف الخسارة.",
         ]
         return "\n".join(lines)
@@ -197,7 +218,7 @@ def advice_text(advice: Advice, lang: str) -> str:
         ]
     lines += [
         "Timeframes: " + ", ".join(view.timeframe for view in advice.views),
-        f"Source: {advice.source or 'unknown'} | last update: {advice.as_of}",
+        f"Source: {advice.source or 'unknown'} | last update: {format_timestamp(advice.as_of, lang)}",
         "These are conditional scenarios, not a guarantee or personalized advice. Define capital, risk, and a stop before acting.",
     ]
     return "\n".join(lines)
