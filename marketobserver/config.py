@@ -11,6 +11,7 @@ class Settings:
     admin_api_key: str
     default_interval: str
     alert_poll_seconds: int
+    signal_scan_seconds: int
     paper_trading: bool
     max_risk_percent: float
     max_position_notional: float
@@ -41,6 +42,7 @@ class Settings:
             admin_api_key=admin_key,
             default_interval=os.getenv("DEFAULT_INTERVAL", "1h"),
             alert_poll_seconds=max(15, int(os.getenv("ALERT_POLL_SECONDS", "60"))),
+            signal_scan_seconds=max(300, int(os.getenv("SIGNAL_SCAN_SECONDS", "900"))),
             paper_trading=os.getenv("PAPER_TRADING", "true").lower() in {"1", "true", "yes", "on"},
             max_risk_percent=float(os.getenv("MAX_RISK_PERCENT", "2")),
             max_position_notional=float(os.getenv("MAX_POSITION_NOTIONAL", "10000")),
