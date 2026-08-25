@@ -28,6 +28,12 @@ ASSETS: dict[str, Asset] = {
     "XAUUSD": Asset("XAUUSD", "الذهب - مرجع العقود الآجلة", "Gold Futures Reference", "metals", "GC=F", "USD", 2),
     "XAGUSD": Asset("XAGUSD", "الفضة - مرجع العقود الآجلة", "Silver Futures Reference", "metals", "SI=F", "USD", 3),
     "USO": Asset("USO", "صندوق النفط USO", "USO Oil ETF", "commodity", "USO", "USD", 2),
+    "WTI": Asset("WTI", "خام غرب تكساس - مرجع العقود الآجلة", "WTI Crude Futures Reference", "commodity", "CL=F", "USD", 2),
+    "BRENT": Asset("BRENT", "خام برنت - مرجع العقود الآجلة", "Brent Crude Futures Reference", "commodity", "BZ=F", "USD", 2),
+    "GASOLINE": Asset("GASOLINE", "البنزين - مرجع العقود الآجلة", "RBOB Gasoline Futures Reference", "commodity", "RB=F", "USD", 4),
+    "NATGAS": Asset("NATGAS", "الغاز الطبيعي - مرجع العقود الآجلة", "Natural Gas Futures Reference", "commodity", "NG=F", "USD", 3),
+    "COPPER": Asset("COPPER", "النحاس - مرجع العقود الآجلة", "Copper Futures Reference", "commodity", "HG=F", "USD", 4),
+    "DXY": Asset("DXY", "مؤشر الدولار", "US Dollar Index Futures Reference", "index", "DX-Y.NYB", "USD", 3),
     "AAPL": Asset("AAPL", "أبل", "Apple", "stock", "AAPL", "USD", 2),
     "TSLA": Asset("TSLA", "تسلا", "Tesla", "stock", "TSLA", "USD", 2),
     "NVDA": Asset("NVDA", "إنفيديا", "NVIDIA", "stock", "NVDA", "USD", 2),
@@ -40,8 +46,8 @@ ALIASES: dict[str, str] = {
     "الذهب": "XAUUSD", "ذهب": "XAUUSD", "xau": "XAUUSD", "xauusd": "XAUUSD", "gold": "XAUUSD",
     "paxg": "PAXG", "البيتكوين": "BTC", "بيتكوين": "BTC", "btc": "BTC", "bitcoin": "BTC",
     "الإيثريوم": "ETH", "إيثريوم": "ETH", "اثيريوم": "ETH", "eth": "ETH", "ethereum": "ETH",
-    "سولانا": "SOL", "sol": "SOL", "solana": "SOL", "الفضة": "XAGUSD", "فضة": "XAGUSD", "silver": "XAGUSD", "xag": "XAGUSD",
-    "النفط": "USO", "نفط": "USO", "oil": "USO", "crude": "USO", "تسلا": "TSLA", "tesla": "TSLA", "tsla": "TSLA",
+    "سولانا": "SOL", "sol": "SOL", "solana": "SOL", "الفضة": "XAGUSD", "فضة": "XAGUSD", "الفضه": "XAGUSD", "فضه": "XAGUSD", "silver": "XAGUSD", "xag": "XAGUSD",
+    "النفط": "WTI", "نفط": "WTI", "خام غرب تكساس": "WTI", "wti": "WTI", "oil": "WTI", "crude": "WTI", "برنت": "BRENT", "خام برنت": "BRENT", "brent": "BRENT", "البنزين": "GASOLINE", "بنزين": "GASOLINE", "gasoline": "GASOLINE", "rbob": "GASOLINE", "الغاز": "NATGAS", "الغاز الطبيعي": "NATGAS", "natural gas": "NATGAS", "natgas": "NATGAS", "النحاس": "COPPER", "copper": "COPPER", "مؤشر الدولار": "DXY", "dxy": "DXY", "تسلا": "TSLA", "tesla": "TSLA", "tsla": "TSLA",
     "انفيديا": "NVDA", "إنفيديا": "NVDA", "nvidia": "NVDA", "nvda": "NVDA", "ابل": "AAPL", "أبل": "AAPL", "apple": "AAPL", "aapl": "AAPL",
     "مايكروسوفت": "MSFT", "microsoft": "MSFT", "msft": "MSFT", "sp500": "SPY", "s&p500": "SPY", "nasdaq": "QQQ", "qqq": "QQQ",
     "اليورو": "EURUSD", "يورو": "EURUSD", "eurusd": "EURUSD", "eur/usd": "EURUSD", "euro": "EURUSD",
@@ -52,7 +58,7 @@ ALIASES: dict[str, str] = {
 
 def normalize_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text or "").lower().strip()
-    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه")
     return re.sub(r"\s+", " ", text)
 
 
