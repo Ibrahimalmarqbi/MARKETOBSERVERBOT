@@ -96,7 +96,12 @@ class MarketDataProvider:
     def _yahoo(self, asset: Asset, interval: str, limit: int) -> list[Candle]:
         try:
             period = "2y" if interval in {"1d", "1wk", "1mo"} else "60d"
-            frame = yf.Ticker(asset.provider_symbol).history(period=period, interval=interval, auto_adjust=False, actions=False)
+            fetch_interval = "1h" if interval == "4h" else interval
+            frame = yf.Ticker(asset.provider_symbol).history(period=period, interval=fetch_interval, auto_adjust=False, actions=False)
+            if interval == "4h" and frame is not None and not frame.empty:
+                frame = frame.resample("4h").agg({
+                    "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum",
+                }).dropna(subset=["Open", "High", "Low", "Close"])
             if frame is None or frame.empty:
                 return []
             frame = frame.dropna(subset=["Open", "High", "Low", "Close"]).tail(limit)
