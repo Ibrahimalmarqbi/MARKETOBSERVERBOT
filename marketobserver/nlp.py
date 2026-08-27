@@ -42,11 +42,11 @@ def _timeframe(text: str) -> str | None:
 
 def _intent(text: str) -> str:
     lowered = normalize_text(text)
-    if re.search(r"(من انت|من انت؟|من مطورك|من صنعك|مين انت|who are you|your developer|developer|مساعده|مساعده|help|مرحبا|اهلا|السلام عليكم|شكرا|thanks|thank you|hello|hi)", lowered):
+    if re.search(r"(من انت|من مطورك|من صنعك|مين انت|who are you|your developer|developer|مساعده|help|مرحبا|اهلا|السلام عليكم|شكرا|thanks|thank you|hello|hi)", lowered):
         return "general"
-    if re.search(r"(افضل اصل|أفضل اصل|افضل عمله|أفضل عملة|افضل سهم|أفضل سهم|ماذا اشتري|وش اشتري|what should i buy|best asset|best coin|best stock|rank|ترتيب)", lowered):
+    if re.search(r"(افضل اصل|افضل عمله|افضل سهم|ماذا اشتري|وش اشتري|what should i buy|best asset|best coin|best stock|rank|ترتيب)", lowered):
         return "rank"
-    if re.search(r"(خبر|اخبار|أخبار|news|headline|sentiment|مشاعر السوق|معنويات)", lowered):
+    if re.search(r"(خبر|اخبار|news|headline|sentiment|مشاعر السوق|معنويات)", lowered):
         return "news"
     if re.search(r"(نبه|تنبيه|اشعار|راقب|alert|notify|watch)", lowered):
         return "alert"
@@ -56,15 +56,33 @@ def _intent(text: str) -> str:
         return "chart"
     if re.search(r"(انصح|تنصح|نصيحه|رايك|مناسب|ادخل|دخول|شراء|اشتر|buy|entry|enter|sell|بيع|اخرج|خروج|exit|ابيع|الوقت المناسب)", lowered):
         return "advice"
-    if re.search(r"(لماذا|ليش|اشرح|سبب|why|explain|تحليل|حلل|وضع|اتجاه|analysis|trend)", lowered):
+    if re.search(r"(ما هو|ماهي|ما هي|اش يعني|يعني ايش|تعريف|كيف يعمل|ما الفرق|الفرق بين|what is|what are|how does|difference between|explain)", lowered):
+        return "education"
+    if re.search(r"(لماذا|ليش|سبب|why|تحليل|حلل|وضع|اتجاه|analysis|trend)", lowered):
         return "analysis"
-    return "analysis"
+    return "unknown"
+
+
+def _refers_to_last_asset(text: str) -> bool:
+    lowered = normalize_text(text)
+    return bool(re.search(r"(حلله|حللها|حلل هذا|هذا الاصل|السعر الحالي|سعره|سعرها|الاتجاه الحالي|اتجاهه|اتجاهها|وضعه|وضعها|اخباره|اخبارها|تحليله|تحليلها|this asset|its price|current price|current trend|analyze it)", lowered))
+
+
+def _known_education_topic(text: str) -> bool:
+    lowered = normalize_text(text)
+    return bool(re.search(r"(rsi|مؤشر القوه النسبيه|وقف الخساره|وقف الخساره|دعم|مقاومه|تضخم|فائده|فائدة|تداول|استثمار|رافعة|رافعه|هامش|leverage|margin|stop loss|support|resistance|inflation|interest rate|trading|investing)", lowered))
 
 
 def parse_request(text: str, last_asset_key: str | None = None) -> UserRequest:
     intent = _intent(text)
     asset = resolve_asset(text)
-    if asset is None and last_asset_key and intent in {"analysis", "advice", "chart", "news"}:
+    if intent == "education" and asset is None and not _known_education_topic(text):
+        intent = "unknown"
+    if intent == "unknown" and asset is not None:
+        intent = "analysis"
+    if asset is None and last_asset_key and intent in {"advice", "chart", "news"}:
+        asset = resolve_asset(last_asset_key)
+    elif asset is None and last_asset_key and intent == "analysis" and _refers_to_last_asset(text):
         asset = resolve_asset(last_asset_key)
     return UserRequest(
         raw_text=text or "",
