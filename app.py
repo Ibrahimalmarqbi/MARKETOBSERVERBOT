@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import io
 import logging
 import re
@@ -25,7 +26,7 @@ from marketobserver.broker import LiveBrokerNotConfigured, OrderRequest, PaperBr
 from marketobserver.config import Settings
 from marketobserver.db import Database
 from marketobserver.market_data import DataUnavailable, MarketDataProvider
-from marketobserver.research import MarketResearch, ResearchSnapshot, headline_fingerprint, headline_importance
+from marketobserver.research import MarketResearch, ResearchSnapshot, headline_fingerprint, headline_importance_level
 from marketobserver.risk import calculate_position_size
 from marketobserver.llm import GroundedLLM
 
@@ -438,18 +439,75 @@ def signals_cmd(message: types.Message):
     bot.reply_to(message, "تم تفعيل المراقبة التلقائية." if enabled and lang == "ar" else "تم إيقاف المراقبة التلقائية." if lang == "ar" else "Automatic signal monitoring enabled." if enabled else "Automatic signal monitoring disabled.")
 
 
+def _headline_parts(title: str) -> tuple[str, str | None]:
+    """Split a common RSS title suffix such as ' - Reuters' from the headline."""
+    cleaned = re.sub(r"\s+", " ", (title or "").strip())
+    if " - " in cleaned:
+        headline, source = cleaned.rsplit(" - ", 1)
+        if 2 <= len(source) <= 48:
+            return headline.strip(), source.strip()
+    return cleaned, None
+
+
+def _news_time(published: str | None, lang: str, tz_name: str) -> str:
+    if not published:
+        return "غير معروف" if lang == "ar" else "unknown"
+    try:
+        return format_timestamp(parsedate_to_datetime(published), lang, tz_name)
+    except (TypeError, ValueError, OverflowError):
+        return published
+
+
+def _news_guidance(sentiment: str, lang: str) -> tuple[str, str]:
+    if lang == "ar":
+        before = "تجنب الدخول أثناء أول حركة؛ خفّض الرافعة وانتظر هدوء السبريد."
+        after = "بعد الخبر: انتظر إغلاق شمعة تأكيد، ثم قيّم الاتجاه والدعم والمقاومة؛ الخبر وحده ليس إشارة دخول."
+    else:
+        before = "Avoid entering during the first move; reduce leverage and wait for spreads to normalize."
+        after = "After the news: wait for a confirming candle, then reassess trend and levels; the headline alone is not an entry signal."
+    return before, after
+
+
 def news_alert_text(asset: Asset, items, lang: str, tz_name: str) -> str:
     now = format_timestamp(datetime.now(timezone.utc), lang, tz_name)
-    title = f"🚨 خبر مهم مرتبط بـ {asset.name_ar} ({asset.key})" if lang == "ar" else f"🚨 Important news for {asset.name_en} ({asset.key})"
-    lines = [title, f"وقت الإرسال: {now}" if lang == "ar" else f"Alert time: {now}"]
-    for item in items:
-        label = {"positive": "إيجابي", "negative": "سلبي", "neutral": "محايد"}.get(item.sentiment, item.sentiment) if lang == "ar" else item.sentiment
-        try:
-            published = format_timestamp(parsedate_to_datetime(item.published), lang, tz_name) if item.published else ("غير معروف" if lang == "ar" else "unknown")
-        except (TypeError, ValueError, OverflowError):
-            published = item.published or ("غير معروف" if lang == "ar" else "unknown")
-        lines.append(f"[{label}] {item.title}\n{published}\n{item.link}")
-    lines.append("هذا تنبيه بحثي؛ تحقق من الخبر الأصلي ولا تعتبره أمرًا بالتداول." if lang == "ar" else "This is a research alert; verify the original article and do not treat it as a trading order.")
+    asset_name = asset.name_ar if lang == "ar" else asset.name_en
+    lines = [
+        f"🚨 <b>خبر مهم</b> | <b>{html.escape(asset_name)} ({asset.key})</b>" if lang == "ar" else f"🚨 <b>Important news</b> | <b>{html.escape(asset_name)} ({asset.key})</b>",
+        f"🕒 وقت الإرسال: {html.escape(now)}" if lang == "ar" else f"🕒 Alert time: {html.escape(now)}",
+        "",
+    ]
+    for index, item in enumerate(items[:2]):
+        headline, source_from_title = _headline_parts(item.title)
+        source = source_from_title or "Google News RSS"
+        level = headline_importance_level(item)
+        if lang == "ar":
+            level_label = {"high": "عالية", "medium": "متوسطة", "low": "منخفضة"}.get(level, level)
+            sentiment_label = {"positive": "إيجابي", "negative": "سلبي", "neutral": "محايد"}.get(item.sentiment, "محايد")
+            impact = "قد يرفع التقلب والسيولة على المدى القصير؛ لا يعني اتجاهًا مضمونًا."
+            before, after = _news_guidance(item.sentiment, lang)
+            lines.extend([
+                f"<b>{index + 1}. {html.escape(headline[:220])}</b>",
+                f"🟠 الأهمية: <b>{level_label}</b> | النبرة: {sentiment_label}",
+                f"🕒 الخبر: {html.escape(_news_time(item.published, lang, tz_name))} | المصدر: {html.escape(source)}",
+                f"📌 الأثر المحتمل: {impact}",
+                f"🛡 قبل الخبر: {before}",
+                f"✅ بعد الخبر: {after}",
+            ])
+        else:
+            impact = "May increase short-term volatility and liquidity; it does not guarantee direction."
+            before, after = _news_guidance(item.sentiment, lang)
+            lines.extend([
+                f"<b>{index + 1}. {html.escape(headline[:220])}</b>",
+                f"🟠 Importance: <b>{level}</b> | tone: {html.escape(item.sentiment)}",
+                f"🕒 Published: {html.escape(_news_time(item.published, lang, tz_name))} | source: {html.escape(source)}",
+                f"📌 Potential impact: {impact}",
+                f"🛡 Before news: {before}",
+                f"✅ After news: {after}",
+            ])
+        if item.link:
+            lines.append(f"🔗 <a href=\"{html.escape(item.link, quote=True)}\">فتح المصدر الأصلي</a>" if lang == "ar" else f"🔗 <a href=\"{html.escape(item.link, quote=True)}\">Open original source</a>")
+        lines.append("")
+    lines.append("ℹ️ تنبيه بحثي: تحقق من الخبر الأصلي، ولا تعتبره أمرًا مباشرًا بالتداول." if lang == "ar" else "ℹ️ Research alert: verify the original article; this is not a direct trading order.")
     return "\n".join(lines)
 
 
@@ -790,11 +848,12 @@ def alert_loop():
                                 fresh.append(item)
                                 pending_fingerprints.add(fingerprint)
                         if fresh:
-                            try:
-                                bot.send_message(user.chat_id, news_alert_text(snapshot.asset, fresh[:3], user.language, user.tz_name))
-                                db.set_news_cooldown(user.chat_id, datetime.now(timezone.utc) + timedelta(minutes=30))
-                            except Exception:
-                                logger.exception("news delivery failed chat_id=%s", user.chat_id)
+                            for item in fresh[:2]:
+                                try:
+                                    bot.send_message(user.chat_id, news_alert_text(snapshot.asset, [item], user.language, user.tz_name), parse_mode="HTML", disable_web_page_preview=True)
+                                    db.set_news_cooldown(user.chat_id, datetime.now(timezone.utc) + timedelta(minutes=30))
+                                except Exception:
+                                    logger.exception("news delivery failed chat_id=%s", user.chat_id)
                 for fingerprint in pending_fingerprints:
                     db.mark_news_seen(fingerprint)
                 last_news_scan_at = now
