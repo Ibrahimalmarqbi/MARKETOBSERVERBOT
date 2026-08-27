@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 import re
@@ -42,6 +43,24 @@ _NEGATIVE = {
 }
 
 
+_IMPORTANCE_TERMS = {
+    "fed", "federal reserve", "interest rate", "rate decision", "cpi", "inflation", "jobs report", "nonfarm", "sanctions", "war", "ceasefire", "opec", "earnings", "guidance", "bankruptcy", "default", "hack", "etf", "approval", "sec", "رفع الفائدة", "خفض الفائدة", "التضخم", "الاحتياطي الفيدرالي", "أوبك", "أرباح", "إفلاس", "اختراق", "عقوبات", "حرب"
+}
+
+
+def headline_importance(item: NewsItem) -> tuple[bool, str]:
+    lowered = item.title.casefold()
+    matches = [term for term in _IMPORTANCE_TERMS if term in lowered]
+    if matches:
+        return True, "matched macro or market-moving term: " + ", ".join(matches[:3])
+    return False, "no high-impact keyword detected"
+
+
+def headline_fingerprint(item: NewsItem) -> str:
+    raw = f"{item.title.strip().casefold()}|{item.link.strip()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _sentiment(title: str) -> str:
     words = set(re.findall(r"[A-Za-z]+|[\u0600-\u06ff]+", title.lower()))
     score = len(words & _POSITIVE) - len(words & _NEGATIVE)
@@ -53,6 +72,14 @@ class MarketResearch:
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "MarketObserverPro/1.0"})
+
+    def important_news(self, asset: Asset, limit: int = 8) -> ResearchSnapshot:
+        snapshot = self.news(asset, limit=max(limit, 12))
+        important = tuple(item for item in snapshot.items if headline_importance(item)[0])[:limit]
+        positive = sum(item.sentiment == "positive" for item in important)
+        negative = sum(item.sentiment == "negative" for item in important)
+        neutral = len(important) - positive - negative
+        return ResearchSnapshot(asset, important, positive, negative, neutral, snapshot.source, snapshot.as_of)
 
     def news(self, asset: Asset, limit: int = 8) -> ResearchSnapshot:
         query = urllib.parse.quote(f"{asset.name_en} {asset.key}")
