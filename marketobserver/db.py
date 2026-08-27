@@ -26,6 +26,10 @@ class User(Base):
     tz_name: Mapped[str] = mapped_column(String(64), default="Asia/Riyadh")
     signals_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     signal_cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    news_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    news_assets: Mapped[str] = mapped_column(String(500), default="ALL")
+    news_preference_set: Mapped[bool] = mapped_column(Boolean, default=False)
+    news_cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -40,6 +44,13 @@ class Alert(Base):
     status: Mapped[str] = mapped_column(String(20), default="active", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class NewsSeen(Base):
+    __tablename__ = "news_seen"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class PaperAccount(Base):
@@ -93,6 +104,14 @@ class Database:
             missing.append("ALTER TABLE users ADD COLUMN signals_enabled BOOLEAN DEFAULT FALSE")
         if "signal_cooldown_until" not in columns:
             missing.append("ALTER TABLE users ADD COLUMN signal_cooldown_until TIMESTAMP NULL")
+        if "news_enabled" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN news_enabled BOOLEAN DEFAULT FALSE")
+        if "news_cooldown_until" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN news_cooldown_until TIMESTAMP NULL")
+        if "news_assets" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN news_assets VARCHAR(500) DEFAULT 'ALL'")
+        if "news_preference_set" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN news_preference_set BOOLEAN DEFAULT FALSE")
         if missing:
             with self.engine.begin() as connection:
                 for statement in missing:
@@ -149,6 +168,30 @@ class Database:
     def set_signal_cooldown(self, chat_id: int, until: datetime) -> None:
         with self.session() as s:
             s.execute(update(User).where(User.chat_id == chat_id).values(signal_cooldown_until=until, updated_at=utcnow()))
+
+    def set_news_enabled(self, chat_id: int, enabled: bool, assets: str | None = None) -> None:
+        with self.session() as s:
+            values = {"news_enabled": enabled, "news_preference_set": True, "updated_at": utcnow()}
+            if assets:
+                values["news_assets"] = assets
+            s.execute(update(User).where(User.chat_id == chat_id).values(**values))
+
+    def news_users(self) -> list[User]:
+        with self.session() as s:
+            return list(s.scalars(select(User).where(User.is_active.is_(True), (User.news_preference_set.is_(False) | User.news_enabled.is_(True)))).all())
+
+    def set_news_cooldown(self, chat_id: int, until: datetime) -> None:
+        with self.session() as s:
+            s.execute(update(User).where(User.chat_id == chat_id).values(news_cooldown_until=until, updated_at=utcnow()))
+
+    def news_was_seen(self, fingerprint: str) -> bool:
+        with self.session() as s:
+            return s.scalar(select(NewsSeen.id).where(NewsSeen.fingerprint == fingerprint)) is not None
+
+    def mark_news_seen(self, fingerprint: str) -> None:
+        with self.session() as s:
+            if s.scalar(select(NewsSeen.id).where(NewsSeen.fingerprint == fingerprint)) is None:
+                s.add(NewsSeen(fingerprint=fingerprint))
 
     def add_alert(self, chat_id: int, asset_key: str, target_price: float, condition: str) -> Alert:
         with self.session() as s:
