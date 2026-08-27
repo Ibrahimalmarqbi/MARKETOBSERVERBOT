@@ -15,6 +15,10 @@ services:
         value: 1h
       - key: ALERT_POLL_SECONDS
         value: "60"
+      - key: SIGNAL_SCAN_SECONDS
+        value: "900"
+      - key: NEWS_SCAN_SECONDS
+        value: "900"
       - key: PAPER_TRADING
         value: "true"
       - key: MAX_RISK_PERCENT
