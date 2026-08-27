@@ -58,6 +58,37 @@ def unknown_asset_text(lang: str) -> str:
             if lang == "ar" else f"I could not identify the asset. Use a clear name or ticker, for example: {examples}.")
 
 
+def out_of_scope_response(lang: str) -> str:
+    if lang == "ar":
+        return ("لا أملك إجابة موثوقة لهذا السؤال لأنه خارج نطاقي الحالي. أنا متخصص في تحليل الأسواق "
+                "والأصول المدعومة، الأخبار الاقتصادية، المخاطر، الشروحات المالية، والتنبيهات. "
+                "إذا أردت تحليلًا فاكتب اسم الأصل بوضوح، مثل: حلل الذهب أو أخبار BTC.")
+    return ("I do not have a reliable answer because this question is outside my current scope. "
+            "I specialize in supported market assets, economic news, risk, financial explanations, and alerts. "
+            "For analysis, include the asset clearly, such as: analyze gold or BTC news.")
+
+
+def education_response(lang: str, text: str, asset: Asset | None = None) -> str:
+    lowered = text.lower()
+    if "rsi" in lowered or "مؤشر القوة النسبية" in text or "مؤشر القوه النسبيه" in text:
+        return ("RSI يقيس زخم الحركة من 0 إلى 100. ارتفاعه فوق 70 قد يعني تشبعًا شرائيًا، وانخفاضه تحت 30 قد يعني تشبعًا بيعيًا، لكن ذلك ليس إشارة بيع أو شراء منفردة. يجب دمجه مع الاتجاه والدعم والمقاومة وإدارة المخاطر."
+                if lang == "ar" else "RSI measures momentum on a 0–100 scale. Above 70 may indicate overbought conditions and below 30 may indicate oversold conditions, but neither is a standalone buy or sell signal. Combine it with trend, support/resistance, and risk management.")
+    if "وقف الخساره" in text or "وقف الخسارة" in text or "stop loss" in lowered:
+        return ("وقف الخسارة مستوى إلغاء للصفقة؛ يحدد مسبقًا النقطة التي يصبح عندها السيناريو غير صالح. لا تضعه عشوائيًا، واحسب حجم الصفقة بحيث لا تتجاوز الخسارة المحتملة نسبة المخاطرة المسموح بها."
+                if lang == "ar" else "A stop loss is a pre-defined invalidation level for a trade. It should be placed based on the market structure, not randomly, and position size should keep the potential loss within your risk limit.")
+    if "دعم" in text or "مقاومه" in text or "مقاومة" in text or "support" in lowered or "resistance" in lowered:
+        return ("الدعم منطقة قد يظهر عندها طلب، والمقاومة منطقة قد يظهر عندها عرض. هما منطقتان وليستا خطين مضمونين؛ يلزم انتظار تأكيد من السعر والحجم أو الإغلاق قبل اعتبار الكسر حقيقيًا."
+                if lang == "ar" else "Support is an area where demand may appear, while resistance is an area where supply may appear. They are zones, not guaranteed lines; wait for price and, when available, volume or close confirmation before treating a breakout as real.")
+    if "تضخم" in text or "التضخم" in text or "inflation" in lowered:
+        return ("التضخم هو ارتفاع مستمر في المستوى العام للأسعار. تأثيره على الأصل ليس ثابتًا؛ يتأثر بالتوقعات، الفائدة، العملة، والسيولة، لذلك لا يكفي ذكر التضخم وحده لاتخاذ قرار تداول."
+                if lang == "ar" else "Inflation is a sustained rise in the general price level. Its effect on an asset is not fixed; expectations, interest rates, currency, and liquidity also matter, so inflation alone is not enough for a trading decision.")
+    if asset:
+        name = asset.name_ar if lang == "ar" else asset.name_en
+        return (f"{name} أصل مالي يمكنني تحليل سعره واتجاهه وأخباره عند طلب ذلك. أما التعريف الأساسي لهذا الأصل فلا يكفي وحده لاتخاذ قرار شراء أو بيع؛ اكتب مثلًا: حلل {name} أو ما أخباره؟"
+                if lang == "ar" else f"{name} is a financial asset whose price, trend, and related news I can analyze. A basic description alone is not a buy or sell decision; ask, for example: analyze {name} or show its news.")
+    return out_of_scope_response(lang)
+
+
 def news_text(snapshot: ResearchSnapshot, lang: str) -> str:
     if not snapshot.items:
         return (f"لا توجد عناوين موثوقة متاحة حاليًا لـ {snapshot.asset.name_ar}. لم يتم اختلاق أخبار أو مشاعر سوقية."
@@ -614,6 +645,12 @@ def text_cmd(message: types.Message):
     lang = request.language
     if request.intent == "general":
         bot.reply_to(message, general_response(lang))
+        return
+    if request.intent == "education":
+        bot.reply_to(message, education_response(lang, text, asset))
+        return
+    if request.intent == "unknown":
+        bot.reply_to(message, out_of_scope_response(lang) if not asset else education_response(lang, text, asset))
         return
     if request.intent == "rank":
         bot.reply_to(message, rank_assets(lang))
