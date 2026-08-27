@@ -7,6 +7,7 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import matplotlib
@@ -24,7 +25,7 @@ from marketobserver.broker import LiveBrokerNotConfigured, OrderRequest, PaperBr
 from marketobserver.config import Settings
 from marketobserver.db import Database
 from marketobserver.market_data import DataUnavailable, MarketDataProvider
-from marketobserver.research import MarketResearch, ResearchSnapshot
+from marketobserver.research import MarketResearch, ResearchSnapshot, headline_fingerprint, headline_importance
 from marketobserver.risk import calculate_position_size
 from marketobserver.llm import GroundedLLM
 
@@ -40,6 +41,7 @@ llm = GroundedLLM(settings.llm_api_key, settings.llm_api_base, settings.llm_mode
 paper_broker = PaperBroker()
 live_broker = LiveBrokerNotConfigured()
 last_signal_scan_at = 0.0
+last_news_scan_at = 0.0
 bot = telebot.TeleBot(settings.telegram_token, threaded=True)
 app = Flask(__name__)
 
@@ -405,6 +407,51 @@ def signals_cmd(message: types.Message):
     bot.reply_to(message, "تم تفعيل المراقبة التلقائية." if enabled and lang == "ar" else "تم إيقاف المراقبة التلقائية." if lang == "ar" else "Automatic signal monitoring enabled." if enabled else "Automatic signal monitoring disabled.")
 
 
+def news_alert_text(asset: Asset, items, lang: str, tz_name: str) -> str:
+    now = format_timestamp(datetime.now(timezone.utc), lang, tz_name)
+    title = f"🚨 خبر مهم مرتبط بـ {asset.name_ar} ({asset.key})" if lang == "ar" else f"🚨 Important news for {asset.name_en} ({asset.key})"
+    lines = [title, f"وقت الإرسال: {now}" if lang == "ar" else f"Alert time: {now}"]
+    for item in items:
+        label = {"positive": "إيجابي", "negative": "سلبي", "neutral": "محايد"}.get(item.sentiment, item.sentiment) if lang == "ar" else item.sentiment
+        try:
+            published = format_timestamp(parsedate_to_datetime(item.published), lang, tz_name) if item.published else ("غير معروف" if lang == "ar" else "unknown")
+        except (TypeError, ValueError, OverflowError):
+            published = item.published or ("غير معروف" if lang == "ar" else "unknown")
+        lines.append(f"[{label}] {item.title}\n{published}\n{item.link}")
+    lines.append("هذا تنبيه بحثي؛ تحقق من الخبر الأصلي ولا تعتبره أمرًا بالتداول." if lang == "ar" else "This is a research alert; verify the original article and do not treat it as a trading order.")
+    return "\n".join(lines)
+
+
+@bot.message_handler(commands=["newsalerts"])
+def newsalerts_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    parts = message.text.split(maxsplit=1)
+    if len(parts) == 1:
+        user = db.get_user(message.chat.id)
+        enabled = bool(user is None or not user.news_preference_set or user.news_enabled)
+        scope = (user.news_assets if user else "ALL")
+        bot.reply_to(message, f"تنبيهات الأخبار: {'مفعلة' if enabled else 'متوقفة'} | النطاق: {scope}. استخدم /newsalerts on أو /newsalerts all أو /newsalerts off." if lang == "ar" else f"News alerts: {'on' if enabled else 'off'} | scope: {scope}. Use /newsalerts on, /newsalerts all, or /newsalerts off.")
+        return
+    value = parts[1].strip().lower()
+    if value in {"off", "ايقاف", "إيقاف"}:
+        db.set_news_enabled(message.chat.id, False)
+        bot.reply_to(message, "تم إيقاف تنبيهات الأخبار." if lang == "ar" else "News alerts disabled.")
+        return
+    if value in {"all", "الكل", "كل"}:
+        scope = ",".join(list(ASSETS.keys())[:12])
+    elif value in {"on", "تشغيل"}:
+        scope = (db.get_user(message.chat.id).last_asset if db.get_user(message.chat.id) else "BTC")
+    else:
+        resolved = resolve_asset(value)
+        if not resolved:
+            bot.reply_to(message, "اكتب /newsalerts on أو all أو اسم أصل مثل BTC أو الذهب." if lang == "ar" else "Use /newsalerts on, all, or an asset such as BTC or gold.")
+            return
+        scope = resolved.key
+    db.set_news_enabled(message.chat.id, True, scope)
+    bot.reply_to(message, f"تم تفعيل تنبيهات الأخبار للنطاق: {scope}." if lang == "ar" else f"News alerts enabled for: {scope}.")
+
+
 @bot.message_handler(commands=["timezone"])
 def timezone_cmd(message: types.Message):
     lang = user_language(message)
@@ -624,7 +671,7 @@ def text_cmd(message: types.Message):
 
 
 def alert_loop():
-    global last_signal_scan_at
+    global last_signal_scan_at, last_news_scan_at
     while True:
         try:
             active = db.active_alerts()
@@ -675,6 +722,45 @@ def alert_loop():
                         except Exception:
                             logger.exception("signal delivery failed chat_id=%s", user.chat_id)
                 last_signal_scan_at = now
+            if now - last_news_scan_at >= settings.news_scan_seconds:
+                users = db.news_users()
+                snapshots = {}
+                pending_fingerprints = set()
+                for user in users:
+                    scope = (user.news_assets or "ALL").strip()
+                    requested = list(ASSETS.keys())[:12] if scope.upper() == "ALL" else [key.strip() for key in scope.split(",") if key.strip()]
+                    for asset_key in requested:
+                        asset = ASSETS.get(asset_key)
+                        if asset and asset.key not in snapshots:
+                            try:
+                                snapshots[asset.key] = research.important_news(asset, limit=5)
+                            except Exception:
+                                logger.exception("news scan failed asset=%s", asset_key)
+                current_news_time = datetime.now(timezone.utc)
+                for user in users:
+                    if user.news_cooldown_until and user.news_cooldown_until > current_news_time:
+                        continue
+                    scope = (user.news_assets or "ALL").strip()
+                    requested = list(ASSETS.keys())[:12] if scope.upper() == "ALL" else [key.strip() for key in scope.split(",") if key.strip()]
+                    for asset_key in requested:
+                        snapshot = snapshots.get(asset_key)
+                        if not snapshot or not snapshot.items:
+                            continue
+                        fresh = []
+                        for item in snapshot.items:
+                            fingerprint = headline_fingerprint(item)
+                            if not db.news_was_seen(fingerprint):
+                                fresh.append(item)
+                                pending_fingerprints.add(fingerprint)
+                        if fresh:
+                            try:
+                                bot.send_message(user.chat_id, news_alert_text(snapshot.asset, fresh[:3], user.language, user.tz_name))
+                                db.set_news_cooldown(user.chat_id, datetime.now(timezone.utc) + timedelta(minutes=30))
+                            except Exception:
+                                logger.exception("news delivery failed chat_id=%s", user.chat_id)
+                for fingerprint in pending_fingerprints:
+                    db.mark_news_seen(fingerprint)
+                last_news_scan_at = now
         except Exception:
             logger.exception("alert loop failure")
         time.sleep(settings.alert_poll_seconds)
