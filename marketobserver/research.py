@@ -48,12 +48,25 @@ _IMPORTANCE_TERMS = {
 }
 
 
-def headline_importance(item: NewsItem) -> tuple[bool, str]:
+def _importance_matches(item: NewsItem) -> list[str]:
     lowered = item.title.casefold()
-    matches = [term for term in _IMPORTANCE_TERMS if term in lowered]
+    return [term for term in _IMPORTANCE_TERMS if term in lowered]
+
+
+def headline_importance(item: NewsItem) -> tuple[bool, str]:
+    matches = _importance_matches(item)
     if matches:
         return True, "matched macro or market-moving term: " + ", ".join(matches[:3])
     return False, "no high-impact keyword detected"
+
+
+def headline_importance_level(item: NewsItem) -> str:
+    """Return a conservative label based only on matched headline terms."""
+    matches = _importance_matches(item)
+    critical = {"fed", "federal reserve", "interest rate", "rate decision", "cpi", "inflation", "jobs report", "nonfarm", "sanctions", "war", "ceasefire", "opec", "bankruptcy", "default", "hack", "sec", "رفع الفائدة", "خفض الفائدة", "التضخم", "الاحتياطي الفيدرالي", "أوبك", "إفلاس", "اختراق", "عقوبات", "حرب"}
+    if any(term in critical for term in matches) or len(matches) >= 2:
+        return "high"
+    return "medium" if matches else "low"
 
 
 def headline_fingerprint(item: NewsItem) -> str:
