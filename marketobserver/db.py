@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from contextlib import contextmanager
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, update, delete, Index, inspect, text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, update, delete, Index, inspect, text, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -116,6 +116,12 @@ class Database:
             with self.engine.begin() as connection:
                 for statement in missing:
                     connection.execute(text(statement))
+        # Legacy rows may contain NULLs after an ALTER TABLE migration. They
+        # must receive the automatic default unless the user explicitly opted out.
+        with self.engine.begin() as connection:
+            connection.execute(text("UPDATE users SET news_preference_set = FALSE WHERE news_preference_set IS NULL"))
+            connection.execute(text("UPDATE users SET news_enabled = TRUE WHERE news_preference_set = FALSE AND news_enabled IS NULL"))
+            connection.execute(text("UPDATE users SET news_assets = 'ALL' WHERE news_preference_set = FALSE AND (news_assets IS NULL OR news_assets = '')"))
 
 
     @contextmanager
@@ -141,6 +147,12 @@ class Database:
                 user.language = language
                 if last_asset:
                     user.last_asset = last_asset
+                # Re-enroll legacy users automatically, but never override an
+                # explicit /newsalerts off choice.
+                if user.news_preference_set is not True:
+                    user.news_enabled = True
+                    user.news_assets = user.news_assets or "ALL"
+                    user.news_preference_set = False
                 user.updated_at = utcnow()
             s.flush()
             return user
@@ -176,9 +188,24 @@ class Database:
                 values["news_assets"] = assets
             s.execute(update(User).where(User.chat_id == chat_id).values(**values))
 
+    def migrate_news_subscriptions(self) -> int:
+        """Enroll active legacy users unless they explicitly opted out."""
+        migrated = 0
+        with self.session() as s:
+            users = list(s.scalars(select(User).where(User.is_active.is_(True), or_(User.news_preference_set.is_(False), User.news_preference_set.is_(None)))).all())
+            for user in users:
+                changed = user.news_enabled is not True or not user.news_assets or user.news_preference_set is not False
+                user.news_enabled = True
+                user.news_assets = user.news_assets or "ALL"
+                user.news_preference_set = False
+                if changed:
+                    user.updated_at = utcnow()
+                    migrated += 1
+        return migrated
+
     def news_users(self) -> list[User]:
         with self.session() as s:
-            return list(s.scalars(select(User).where(User.is_active.is_(True), (User.news_preference_set.is_(False) | User.news_enabled.is_(True)))).all())
+            return list(s.scalars(select(User).where(User.is_active.is_(True), or_(User.news_preference_set.is_(False), User.news_preference_set.is_(None), User.news_enabled.is_(True)))).all())
 
     def set_news_cooldown(self, chat_id: int, until: datetime) -> None:
         with self.session() as s:
