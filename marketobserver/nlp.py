@@ -80,7 +80,9 @@ def parse_request(text: str, last_asset_key: str | None = None) -> UserRequest:
         intent = "unknown"
     if intent == "unknown" and asset is not None:
         intent = "analysis"
-    if asset is None and last_asset_key and intent in {"advice", "chart", "news"}:
+    if asset is None and last_asset_key and intent in {"advice", "chart"}:
+        asset = resolve_asset(last_asset_key)
+    elif asset is None and last_asset_key and intent == "news" and _refers_to_last_asset(text):
         asset = resolve_asset(last_asset_key)
     elif asset is None and last_asset_key and intent == "analysis" and _refers_to_last_asset(text):
         asset = resolve_asset(last_asset_key)
