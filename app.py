@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 import time
+from functools import lru_cache
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -94,27 +95,24 @@ def news_text(snapshot: ResearchSnapshot, lang: str) -> str:
     if not snapshot.items:
         return (f"لا توجد عناوين موثوقة متاحة حاليًا لـ {snapshot.asset.name_ar}. لم يتم اختلاق أخبار أو مشاعر سوقية."
                 if lang == "ar" else f"No reliable headlines are available for {snapshot.asset.name_en} right now. No news or sentiment was invented.")
-    if lang == "ar":
-        lines = [
-            f"📰 أخبار {snapshot.asset.name_ar} ({snapshot.asset.key})",
-            f"المشاعر التقريبية للعناوين: إيجابي {snapshot.positive} | سلبي {snapshot.negative} | محايد {snapshot.neutral}",
-            f"المصدر: {snapshot.source} | وقت الجمع: {snapshot.as_of}",
-            "",
-        ]
-        for item in snapshot.items:
-            label = {"positive": "إيجابي", "negative": "سلبي", "neutral": "محايد"}[item.sentiment]
-            lines.append(f"[{label}] {item.title}")
-        lines.append("تصنيف المشاعر آلي وتقريبي للعناوين، وليس قياسًا شاملاً لمشاعر السوق.")
-        return "\n".join(lines)
+    asset_name = snapshot.asset.name_ar if lang == "ar" else snapshot.asset.name_en
     lines = [
-        f"📰 {snapshot.asset.name_en} news ({snapshot.asset.key})",
-        f"Headline sentiment: positive {snapshot.positive} | negative {snapshot.negative} | neutral {snapshot.neutral}",
-        f"Source: {snapshot.source} | collected: {snapshot.as_of}",
+        f"📰 <b>أخبار {html.escape(asset_name)} ({snapshot.asset.key})</b>" if lang == "ar" else f"📰 <b>{html.escape(asset_name)} news ({snapshot.asset.key})</b>",
+        f"المشاعر التقريبية: إيجابي {snapshot.positive} | سلبي {snapshot.negative} | محايد {snapshot.neutral}" if lang == "ar" else f"Approximate sentiment: positive {snapshot.positive} | negative {snapshot.negative} | neutral {snapshot.neutral}",
+        f"المصدر: {html.escape(snapshot.source)} | وقت الجمع: {html.escape(snapshot.as_of)}" if lang == "ar" else f"Source: {html.escape(snapshot.source)} | collected: {html.escape(snapshot.as_of)}",
         "",
     ]
-    for item in snapshot.items:
-        lines.append(f"[{item.sentiment}] {item.title}")
-    lines.append("Headline sentiment is automated and approximate, not a complete measure of market sentiment.")
+    for index, item in enumerate(snapshot.items[:5], 1):
+        headline, source_from_title = _headline_parts(item.title)
+        headline = _translated_headline(headline, lang)
+        source = source_from_title or snapshot.source
+        label = {"positive": "إيجابي", "negative": "سلبي", "neutral": "محايد"}.get(item.sentiment, item.sentiment) if lang == "ar" else item.sentiment
+        lines.append(f"<b>{index}. {html.escape(headline[:220])}</b>")
+        lines.append(f"[{label}] | {html.escape(source)}")
+        if item.link:
+            lines.append(f"🔗 <a href=\"{html.escape(item.link, quote=True)}\">فتح المصدر الأصلي</a>" if lang == "ar" else f"🔗 <a href=\"{html.escape(item.link, quote=True)}\">Open original source</a>")
+        lines.append("")
+    lines.append("تصنيف المشاعر آلي وتقريبي للعناوين، وليس قياسًا شاملاً لمشاعر السوق." if lang == "ar" else "Headline sentiment is automated and approximate, not a complete measure of market sentiment.")
     return "\n".join(lines)
 
 
@@ -458,6 +456,18 @@ def _news_time(published: str | None, lang: str, tz_name: str) -> str:
         return published
 
 
+@lru_cache(maxsize=256)
+def _translated_headline(headline: str, lang: str) -> str:
+    if lang != "ar" or re.search(r"[\u0600-\u06ff]", headline or ""):
+        return headline
+    try:
+        translated = llm.translate_headline(headline, "ar")
+        return translated[:220] if translated else headline
+    except Exception:
+        logger.warning("headline translation unavailable; preserving original title")
+        return headline
+
+
 def _news_guidance(sentiment: str, lang: str) -> tuple[str, str]:
     if lang == "ar":
         before = "تجنب الدخول أثناء أول حركة؛ خفّض الرافعة وانتظر هدوء السبريد."
@@ -478,6 +488,7 @@ def news_alert_text(asset: Asset, items, lang: str, tz_name: str) -> str:
     ]
     for index, item in enumerate(items[:2]):
         headline, source_from_title = _headline_parts(item.title)
+        headline = _translated_headline(headline, lang)
         source = source_from_title or "Google News RSS"
         level = headline_importance_level(item)
         if lang == "ar":
@@ -718,7 +729,7 @@ def text_cmd(message: types.Message):
         return
     if request.intent == "news" and asset:
         try:
-            bot.reply_to(message, news_text(research.news(asset), lang))
+            bot.reply_to(message, news_text(research.news(asset), lang), parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             logger.exception("news research failed")
             bot.reply_to(message, "تعذر جلب الأخبار حاليًا." if lang == "ar" else "News research is temporarily unavailable.")
