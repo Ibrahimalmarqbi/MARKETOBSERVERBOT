@@ -102,7 +102,7 @@ def news_text(snapshot: ResearchSnapshot, lang: str) -> str:
         f"المصدر: {html.escape(snapshot.source)} | وقت الجمع: {html.escape(snapshot.as_of)}" if lang == "ar" else f"Source: {html.escape(snapshot.source)} | collected: {html.escape(snapshot.as_of)}",
         "",
     ]
-    for index, item in enumerate(snapshot.items[:5], 1):
+    for index, item in enumerate(snapshot.items[:2], 1):
         headline, source_from_title = _headline_parts(item.title)
         headline = _translated_headline(headline, lang)
         source = source_from_title or snapshot.source
@@ -735,7 +735,7 @@ def text_cmd(message: types.Message):
             bot.reply_to(message, "تعذر جلب الأخبار حاليًا." if lang == "ar" else "News research is temporarily unavailable.")
         return
     if request.intent == "news" and not asset:
-        bot.reply_to(message, "اكتب الأصل مع طلب الأخبار، مثل: أخبار الذهب أو مشاعر البيتكوين." if lang == "ar" else "Name the asset, for example: gold news or Bitcoin sentiment.")
+        bot.reply_to(message, "اذكر الأصل المطلوب مع الأخبار، مثل: أخبار الذهب أو أخبار BTC. لم أستخدم أصلًا افتراضيًا." if lang == "ar" else "Name the asset with the news request, for example: gold news or BTC news. No default asset was used.")
         return
     if asset:
         try:
