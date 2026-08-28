@@ -27,6 +27,28 @@ class GroundedLLM:
     def enabled(self) -> bool:
         return self.client is not None
 
+    def translate_headline(self, headline: str, target_language: str) -> str:
+        if not self.client:
+            raise LLMUnavailable("LLM is not configured")
+        target = "Arabic" if target_language == "ar" else "English"
+        system = (
+            f"You are a faithful financial-news translator. Translate the supplied headline into {target}. "
+            "Return only the translation, with no commentary. Do not add facts, predictions, sentiment, or advice. "
+            "Preserve tickers, company names, currencies, percentages, dates, and numbers exactly. Keep it under 220 characters."
+        )
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": headline},
+            ],
+            max_completion_tokens=220,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise LLMUnavailable("LLM returned empty translation")
+        return content.strip().strip('"')
+
     def explain(self, language: str, user_question: str, facts: dict) -> str:
         if not self.client:
             raise LLMUnavailable("LLM is not configured")
