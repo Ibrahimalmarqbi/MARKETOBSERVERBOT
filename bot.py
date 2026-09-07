@@ -273,6 +273,18 @@ if m.from_user.id != ADMIN_ID:
     broadcast(msg)
     bot.reply_to(m, "تم الإرسال للجميع")
 
+
+
+@bot.message_handler(commands=['testusers'])
+def test_users(m):
+    users = get_all_users()
+    bot.reply_to(m, str(users))
+
+
+
+
+
+
 # ================== FLASK ==================
 app = Flask(__name__)
 
