@@ -31,6 +31,12 @@ def init_db():
     c = conn.cursor()
 
     c.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        chat_id INTEGER PRIMARY KEY
+    )
+    """)
+
+    c.execute("""
     CREATE TABLE IF NOT EXISTS alerts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER,
@@ -46,11 +52,18 @@ def init_db():
 
 init_db()
 
+# ================== SAVE USERS ==================
+def save_user(chat_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
+    conn.commit()
+    conn.close()
+
 # ================== API LAYER ==================
 def fetch_klines(symbol):
     symbol = symbol.upper()
 
-    # 1. Binance
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": f"{symbol}USDT", "interval": "1h", "limit": 100}
@@ -61,7 +74,6 @@ def fetch_klines(symbol):
     except:
         pass
 
-    # 2. CryptoCompare
     try:
         url = "https://min-api.cryptocompare.com/data/v2/histohour"
         params = {"fsym": symbol, "tsym": "USD", "limit": 100}
@@ -73,7 +85,6 @@ def fetch_klines(symbol):
     except:
         pass
 
-    # 3. CoinGecko
     try:
         cg = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
         if symbol in cg:
@@ -115,12 +126,12 @@ def calculate_rsi(closes, period=14):
 def get_market_indicators(symbol):
     closes = fetch_klines(symbol)
 
-    if not closes or len(closes) < 50:
+    if not closes or len(closes) < 20:
         return None
 
     price = closes[-1]
     rsi = calculate_rsi(closes)
-    sma50 = sum(closes[-50:]) / 50
+    sma50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else price
 
     return {
         "symbol": symbol,
@@ -154,8 +165,9 @@ def add_alert(chat_id, symbol, price, condition):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
-    c.execute("INSERT INTO alerts VALUES (NULL, ?, ?, ?, ?, 'active')",
-              (chat_id, symbol, price, condition))
+    c.execute("""
+    INSERT INTO alerts VALUES (NULL, ?, ?, ?, ?, 'active')
+    """, (chat_id, symbol, price, condition))
 
     conn.commit()
     conn.close()
@@ -166,7 +178,11 @@ def check_alerts():
             conn = sqlite3.connect(DB_NAME)
             c = conn.cursor()
 
-            c.execute("SELECT id, chat_id, symbol, target_price, condition FROM alerts WHERE status='active'")
+            c.execute("""
+            SELECT id, chat_id, symbol, target_price, condition 
+            FROM alerts WHERE status='active'
+            """)
+
             alerts = c.fetchall()
 
             for a in alerts:
@@ -203,6 +219,7 @@ def extract_symbol(text):
 
 @bot.message_handler(commands=['start'])
 def start(m):
+    save_user(m.chat.id)
     bot.reply_to(m, "Bot ready")
 
 @bot.message_handler(commands=['analyze'])
