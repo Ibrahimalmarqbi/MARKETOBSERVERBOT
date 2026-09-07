@@ -262,6 +262,15 @@ def chart(m):
 
     bot.send_photo(m.chat.id, img)
 
+@bot.message_handler(commands=['broadcast'])
+def broadcast_cmd(m):
+    if m.chat.id != 840153842:
+        return
+
+    msg = m.text.replace("/broadcast", "").strip()
+    broadcast(msg)
+    bot.reply_to(m, "تم الإرسال للجميع")
+
 # ================== FLASK ==================
 app = Flask(__name__)
 
@@ -271,6 +280,24 @@ def home():
 
 def run_server():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+#====================GET ALL THE USERS=====
+def get_all_users():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT chat_id FROM users")
+    users = [row[0] for row in c.fetchall()]
+    conn.close()
+    return users
+#=================BRODCAST FOR MESSAGES FROM ADMIN=======
+def broadcast(message):
+    users = get_all_users()
+
+    for chat_id in users:
+        try:
+            bot.send_message(chat_id, message)
+        except:
+            pass
+
 
 # ================== RUN ==================
 if __name__ == "__main__":
