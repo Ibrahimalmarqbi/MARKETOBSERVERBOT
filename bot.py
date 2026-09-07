@@ -265,12 +265,14 @@ def chart(m):
 @bot.message_handler(commands=['broadcast'])
 def broadcast_cmd(m):
     ADMIN_ID = 840153842
-
+    print("broadcast triggered")
+    print("users:", get_all_users())
     if m.from_user.id != ADMIN_ID:
         return
 
     msg = m.text.replace("/broadcast", "").strip()
     broadcast(msg)
+    
     bot.reply_to(m, "تم الإرسال للجميع")
 
 
