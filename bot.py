@@ -5,8 +5,10 @@ import threading
 import io
 import re
 import requests
-from flask import Flask
+
+from flask import Flask, request
 import telebot
+from telebot import types
 
 import matplotlib
 matplotlib.use('Agg')
@@ -14,8 +16,9 @@ import matplotlib.pyplot as plt
 
 # ================== CONFIG ==================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://your-app.onrender.com/webhook
 
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 DB_NAME = "market_pro.db"
 
 ASSETS_DICTIONARY = {
@@ -52,7 +55,6 @@ def init_db():
 
 init_db()
 
-# ================== SAVE USERS ==================
 def save_user(chat_id):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -60,7 +62,15 @@ def save_user(chat_id):
     conn.commit()
     conn.close()
 
-# ================== API LAYER ==================
+def get_all_users():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT chat_id FROM users")
+    users = [row[0] for row in c.fetchall()]
+    conn.close()
+    return users
+
+# ================== API ==================
 def fetch_klines(symbol):
     symbol = symbol.upper()
 
@@ -69,33 +79,8 @@ def fetch_klines(symbol):
         params = {"symbol": f"{symbol}USDT", "interval": "1h", "limit": 100}
         res = requests.get(url, params=params, timeout=5).json()
 
-        if isinstance(res, list) and len(res) > 0:
+        if isinstance(res, list):
             return [float(c[4]) for c in res]
-    except:
-        pass
-
-    try:
-        url = "https://min-api.cryptocompare.com/data/v2/histohour"
-        params = {"fsym": symbol, "tsym": "USD", "limit": 100}
-        res = requests.get(url, params=params, timeout=5).json()
-
-        data = res.get("Data", {}).get("Data", [])
-        if data:
-            return [float(c["close"]) for c in data]
-    except:
-        pass
-
-    try:
-        cg = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
-        if symbol in cg:
-            url = f"https://api.coingecko.com/api/v3/coins/{cg[symbol]}/market_chart"
-            params = {"vs_currency": "usd", "days": "2"}
-
-            res = requests.get(url, params=params, timeout=5).json()
-            prices = res.get("prices", [])
-
-            if prices:
-                return [p[1] for p in prices[-100:]]
     except:
         pass
 
@@ -126,18 +111,16 @@ def calculate_rsi(closes, period=14):
 def get_market_indicators(symbol):
     closes = fetch_klines(symbol)
 
-    if not closes or len(closes) < 20:
+    if not closes:
         return None
 
     price = closes[-1]
     rsi = calculate_rsi(closes)
-    sma50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else price
 
     return {
         "symbol": symbol,
         "price": price,
         "rsi": rsi,
-        "sma50": sma50,
         "support": price * 0.988,
         "resistance": price * 1.012
     }
@@ -145,7 +128,6 @@ def get_market_indicators(symbol):
 # ================== CHART ==================
 def generate_chart(symbol):
     closes = fetch_klines(symbol)
-
     if not closes:
         return None
 
@@ -160,7 +142,7 @@ def generate_chart(symbol):
 
     return buf
 
-# ================== ALERT SYSTEM ==================
+# ================== ALERTS ==================
 def add_alert(chat_id, symbol, price, condition):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -178,11 +160,7 @@ def check_alerts():
             conn = sqlite3.connect(DB_NAME)
             c = conn.cursor()
 
-            c.execute("""
-            SELECT id, chat_id, symbol, target_price, condition 
-            FROM alerts WHERE status='active'
-            """)
-
+            c.execute("SELECT id, chat_id, symbol, target_price, condition FROM alerts WHERE status='active'")
             alerts = c.fetchall()
 
             for a in alerts:
@@ -195,28 +173,26 @@ def check_alerts():
                 price = data["price"]
 
                 if (cond == "below" and price <= target) or (cond == "above" and price >= target):
-                    try:
-                        bot.send_message(chat_id, f"🔔 {symbol} hit {price}")
-                    except:
-                        pass
+                    bot.send_message(chat_id, f"🔔 {symbol} hit {price}")
 
                     c.execute("UPDATE alerts SET status='done' WHERE id=?", (id_,))
                     conn.commit()
 
             conn.close()
 
-        except:
-            pass
+        except Exception as e:
+            print("check_alerts error:", e)
 
         time.sleep(30)
 
-# ================== TELEGRAM ==================
+# ================== SYMBOL PARSER ==================
 def extract_symbol(text):
     for w in re.findall(r'\b\w+\b', text.lower()):
         if w in ASSETS_DICTIONARY:
             return ASSETS_DICTIONARY[w]
     return "BTC"
 
+# ================== TELEGRAM HANDLERS ==================
 @bot.message_handler(commands=['start'])
 def start(m):
     save_user(m.chat.id)
@@ -228,7 +204,7 @@ def analyze(m):
     data = get_market_indicators(sym)
 
     if not data:
-        bot.reply_to(m, "❌ لا يوجد بيانات حالياً")
+        bot.reply_to(m, "❌ no data")
         return
 
     bot.reply_to(m, f"""
@@ -245,7 +221,7 @@ def alert_cmd(m):
     data = get_market_indicators(sym)
 
     if not data:
-        bot.reply_to(m, "❌ لا يوجد بيانات")
+        bot.reply_to(m, "❌ no data")
         return
 
     add_alert(m.chat.id, sym, data["support"], "below")
@@ -257,7 +233,7 @@ def chart(m):
     img = generate_chart(sym)
 
     if not img:
-        bot.reply_to(m, "❌ لا يوجد بيانات للشارت")
+        bot.reply_to(m, "❌ no chart")
         return
 
     bot.send_photo(m.chat.id, img)
@@ -265,27 +241,24 @@ def chart(m):
 @bot.message_handler(commands=['broadcast'])
 def broadcast_cmd(m):
     ADMIN_ID = 840153842
-    print("broadcast triggered")
-    print("users:", get_all_users())
+
     if m.from_user.id != ADMIN_ID:
         return
 
     msg = m.text.replace("/broadcast", "").strip()
     broadcast(msg)
-    
-    bot.reply_to(m, "تم الإرسال للجميع")
+    bot.reply_to(m, "sent")
 
-
-
-@bot.message_handler(commands=['testusers'])
-def test_users(m):
+# ================== BROADCAST ==================
+def broadcast(message):
     users = get_all_users()
-    bot.reply_to(m, str(users))
 
-
-
-
-
+    for chat_id in users:
+        try:
+            bot.send_message(chat_id, message)
+            time.sleep(0.05)
+        except Exception as e:
+            print("broadcast error:", e)
 
 # ================== FLASK ==================
 app = Flask(__name__)
@@ -294,37 +267,29 @@ app = Flask(__name__)
 def home():
     return "Running"
 
-def run_server():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-#====================GET ALL THE USERS=====
-def get_all_users():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT chat_id FROM users")
-    users = [row[0] for row in c.fetchall()]
-    conn.close()
-    return users
-#=================BRODCAST FOR MESSAGES FROM ADMIN=======
-def broadcast(message):
-    users = get_all_users()
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    json_str = request.get_data().decode("utf-8")
+    update = types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return "OK"
 
-    for chat_id in users:
-        try:
-            bot.send_message(chat_id, message)
-            time.sleep(0.05)  # حماية ضد flood
-        except Exception as e:
-            print(f"Failed for {chat_id}: {e}")
-
+# ================== SET WEBHOOK ==================
+def set_bot_webhook():
+    if WEBHOOK_URL:
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=WEBHOOK_URL)
+        print("Webhook set:", WEBHOOK_URL)
 
 # ================== RUN ==================
+def run_server():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=check_alerts, daemon=True).start()
 
-    print("Bot started")
+    set_bot_webhook()
 
-    while True:
-        try:
-            bot.polling(none_stop=True)
-        except:
-            time.sleep(3)
+    print("Bot running via webhook")
