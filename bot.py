@@ -264,9 +264,11 @@ def chart(m):
 
 @bot.message_handler(commands=['broadcast'])
 def broadcast_cmd(m):
-    if m.chat.id != 840153842:
-        return
+    ADMIN_ID = 840153842
 
+if m.from_user.id != ADMIN_ID:
+    return
+        
     msg = m.text.replace("/broadcast", "").strip()
     broadcast(msg)
     bot.reply_to(m, "تم الإرسال للجميع")
@@ -295,8 +297,9 @@ def broadcast(message):
     for chat_id in users:
         try:
             bot.send_message(chat_id, message)
-        except:
-            pass
+            time.sleep(0.05)  # حماية ضد flood
+        except Exception as e:
+            print(f"Failed for {chat_id}: {e}")
 
 
 # ================== RUN ==================
