@@ -187,18 +187,12 @@ def webhook():
 
 def force_reset():
     try:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
-        def force_reset():
-    try:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
+        requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook"
+        )
         print("🔥 TELEGRAM RESET DONE")
-
-    except:
-        pass
-
-        print("🔥 TELEGRAM RESET DONE")
-    except:
-        pass
+    except Exception as e:
+        print("RESET ERROR:", e)
 
 def set_webhook():
     bot.remove_webhook()
