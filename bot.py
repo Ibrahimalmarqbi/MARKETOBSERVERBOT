@@ -1,248 +1,283 @@
 import os
 import time
 import sqlite3
-import requests
 import threading
+import io
 import re
+import requests
 
 from flask import Flask, request
 import telebot
 from telebot import types
 
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
-# ================= CONFIG =================
+================== CONFIG ==================
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+print("🧠 BOOTING BOT...")
+print("TOKEN EXISTS:", bool(TELEGRAM_TOKEN))
+print("WEBHOOK URL:", WEBHOOK_URL)
 
 if not TELEGRAM_TOKEN:
-    raise Exception("NO TELEGRAM TOKEN FOUND")
+raise Exception("NO TELEGRAM TOKEN FOUND")
 
 bot = telebot.TeleBot(
-    TELEGRAM_TOKEN,
-    threaded=False,
-    skip_pending=True
+TELEGRAM_TOKEN,
+threaded=False,        # مهم: يمنع threads العشوائية
+skip_pending=True
 )
 
-DB_NAME = "market.db"
+DB_NAME = "market_pro.db"
 
-# ================= SINGLE INSTANCE (soft) =================
+================== DEBUG GUARD ==================
 
-_instance_lock = True
-if not _instance_lock:
-    print("DUPLICATE INSTANCE -> EXIT")
-    os._exit(0)
+INSTANCE_FLAG = False
 
-# ================= DB =================
+def single_instance_guard():
+global INSTANCE_FLAG
+if INSTANCE_FLAG:
+print("🚨 DUPLICATE INSTANCE DETECTED - EXITING")
+os._exit(0)
+INSTANCE_FLAG = True
+print("✅ SINGLE INSTANCE LOCK OK")
+
+single_instance_guard()
+
+================== ASSETS ==================
+
+ASSETS_DICTIONARY = {
+"الذهب": "PAXG", "gold": "PAXG",
+"btc": "BTC", "بيتكوين": "BTC",
+"eth": "ETH", "ايثريوم": "ETH",
+"sol": "SOL"
+}
+
+================== DB ==================
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
+print("📦 INIT DB...")
+conn = sqlite3.connect(DB_NAME)
+c = conn.cursor()
 
-    c.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY)")
+c.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY)")  
+c.execute("""  
+CREATE TABLE IF NOT EXISTS alerts (  
+    id INTEGER PRIMARY KEY AUTOINCREMENT,  
+    chat_id INTEGER,  
+    symbol TEXT,  
+    target_price REAL,  
+    condition TEXT,  
+    status TEXT  
+)  
+""")  
 
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        symbol TEXT,
-        target_price REAL,
-        condition TEXT,
-        status TEXT
-    )
-    """)
-
-    conn.commit()
-    conn.close()
+conn.commit()  
+conn.close()  
+print("✅ DB READY")
 
 init_db()
 
 def save_user(chat_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users VALUES (?)", (chat_id,))
-    conn.commit()
-    conn.close()
+conn = sqlite3.connect(DB_NAME)
+c = conn.cursor()
+c.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
+conn.commit()
+conn.close()
+print("👤 USER SAVED:", chat_id)
 
-def get_users():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT chat_id FROM users")
-    data = [x[0] for x in c.fetchall()]
-    conn.close()
-    return data
+def get_all_users():
+conn = sqlite3.connect(DB_NAME)
+c = conn.cursor()
+c.execute("SELECT chat_id FROM users")
+users = [row[0] for row in c.fetchall()]
+conn.close()
+return users
 
-# ================= ASSETS =================
-
-ASSETS = {
-    "btc": "BTC",
-    "bitcoin": "BTC",
-    "eth": "ETH",
-    "gold": "PAXG",
-    "الذهب": "PAXG",
-    "sol": "SOL"
-}
-
-# ================= MARKET DATA (FIXED) =================
+================== MARKET DATA ==================
 
 def fetch_klines(symbol):
-    symbol = symbol.upper()
+symbol = symbol.upper()
+print("📡 FETCH:", symbol)
 
-    urls = [
-        "https://api.binance.com/api/v3/klines",
-        "https://api1.binance.com/api/v3/klines",
-        "https://api2.binance.com/api/v3/klines",
-    ]
+try:  
+    url = "https://api.binance.com/api/v3/klines"  
+    params = {"symbol": f"{symbol}USDT", "interval": "1h", "limit": 100}  
+    headers = {"User-Agent": "Mozilla/5.0"}  
 
-    for url in urls:
-        try:
-            r = requests.get(
-                url,
-                params={
-                    "symbol": f"{symbol}USDT",
-                    "interval": "1h",
-                    "limit": 100
-                },
-                timeout=5,
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
+    res = requests.get(url, params=params, headers=headers, timeout=5)  
+    print("BINANCE STATUS:", res.status_code)  
 
-            if r.status_code == 200:
-                data = r.json()
-                return [float(x[4]) for x in data]
+    data = res.json()  
 
-            print("BINANCE FAIL:", r.status_code)
+    if isinstance(data, list):  
+        print("BINANCE OK DATA")  
+        return [float(c[4]) for c in data]  
 
-        except Exception as e:
-            print("BINANCE ERROR:", e)
+    print("BINANCE BAD RESPONSE:", data)  
 
-    return None
+except Exception as e:  
+    print("BINANCE ERROR:", e)  
 
-# ================= RSI =================
+return None
 
-def rsi(values, period=14):
-    if not values or len(values) < period + 1:
-        return 50
+================== RSI ==================
 
-    gains, losses = [], []
+def calculate_rsi(closes, period=14):
+if not closes or len(closes) < period + 1:
+return 50
 
-    for i in range(1, len(values)):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(abs(min(diff, 0)))
+gains, losses = [], []  
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+for i in range(1, len(closes)):  
+    diff = closes[i] - closes[i - 1]  
+    gains.append(max(diff, 0))  
+    losses.append(abs(min(diff, 0)))  
 
-    if avg_loss == 0:
-        return 100
+avg_gain = sum(gains[:period]) / period  
+avg_loss = sum(losses[:period]) / period  
 
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
+if avg_loss == 0:  
+    return 100  
 
-def market_data(symbol):
-    closes = fetch_klines(symbol)
-    if not closes:
-        return None
+rs = avg_gain / avg_loss  
+return round(100 - (100 / (1 + rs)), 2)
 
-    price = closes[-1]
-    return {
-        "price": price,
-        "rsi": rsi(closes),
-        "support": price * 0.99,
-        "resistance": price * 1.01
-    }
+================== INDICATORS ==================
 
-# ================= FLASK =================
+def get_market_indicators(symbol):
+closes = fetch_klines(symbol)
 
-app = Flask(__name__)
+if not closes:  
+    print("❌ NO MARKET DATA:", symbol)  
+    return None  
+
+price = closes[-1]  
+rsi = calculate_rsi(closes)  
+
+print("📊 DATA OK:", symbol, price, rsi)  
+
+return {  
+    "symbol": symbol,  
+    "price": price,  
+    "rsi": rsi,  
+    "support": price * 0.988,  
+    "resistance": price * 1.012  
+}
+
+================== FLASK ==================
+
+app = Flask(name)
 
 @app.route("/")
 def home():
-    return "OK"
+print("🌐 HOME HIT")
+return "BOT RUNNING"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    try:
-        update = types.Update.de_json(request.data.decode("utf-8"))
-        bot.process_new_updates([update])
-    except Exception as e:
-        print("WEBHOOK ERROR:", e)
+try:
+print("📩 WEBHOOK HIT")
 
-    return "OK"
+json_str = request.get_data().decode("utf-8")  
+    update = types.Update.de_json(json_str)  
 
-# ================= WEBHOOK =================
+    print("➡️ UPDATE RECEIVED")  
+    bot.process_new_updates([update])  
+
+except Exception as e:  
+    print("❌ WEBHOOK ERROR:", e)  
+
+return "OK"
+
+================== WEBHOOK SET ==================
 
 def set_webhook():
-    bot.remove_webhook()
-    time.sleep(2)
-    bot.set_webhook(WEBHOOK_URL)
-    print("WEBHOOK SET:", WEBHOOK_URL)
+try:
+print("🔄 RESET WEBHOOK...")
 
-# ================= HELPERS =================
+bot.remove_webhook()  
+    time.sleep(2)  
 
-def extract_symbol(text):
-    for w in re.findall(r'\b\w+\b', text.lower()):
-        if w in ASSETS:
-            return ASSETS[w]
-    return "BTC"
+    bot.set_webhook(url=WEBHOOK_URL)  
 
-# ================= BROADCAST (IMPORTANT) =================
+    print("✅ WEBHOOK ACTIVE:", WEBHOOK_URL)  
 
-def is_admin(msg):
-    return msg.chat.id == ADMIN_ID
+except Exception as e:  
+    print("❌ WEBHOOK SET ERROR:", e)
 
-@bot.message_handler(commands=["broadcast"])
+================== TELEGRAM HANDLERS ==================
+
+@bot.message_handler(commands=['start'])
+def start(m):
+print("🚀 START CMD:", m.chat.id)
+save_user(m.chat.id)
+bot.reply_to(m, "Bot Ready")
+
+@bot.message_handler(commands=['analyze'])
+def analyze(m):
+print("📊 ANALYZE:", m.text)
+
+sym = extract_symbol(m.text)  
+data = get_market_indicators(sym)  
+
+if not data:  
+    bot.reply_to(m, "No data")  
+    return  
+
+bot.reply_to(m,  
+    f"{sym}\nPrice: {data['price']}\nRSI: {data['rsi']}\nSupport: {data['support']}\nResistance: {data['resistance']}"  
+)
+
+
+
+@bot.message_handler(commands=['broadcast'])
 def broadcast(m):
-    if not is_admin(m):
-        bot.reply_to(m, "No permission")
+    text = m.text.replace('/broadcast', '').strip()
+
+    if not text:
+        bot.reply_to(m, "اكتب الرسالة بعد الأمر")
         return
 
-    text = m.text.replace("/broadcast", "").strip()
-    users = get_users()
+    users = get_all_users()
 
     sent = 0
+    failed = 0
 
-    for uid in users:
+    for chat_id in users:
         try:
-            bot.send_message(uid, text)
+            bot.send_message(chat_id, text)
             sent += 1
-        except:
-            pass
+        except Exception as e:
+            print("BROADCAST ERROR:", chat_id, e)
+            failed += 1
 
-    bot.reply_to(m, f"Sent to {sent} users")
+    bot.reply_to(m, f"Done\nSent: {sent}\nFailed: {failed}")
 
-# ================= HANDLERS =================
 
-@bot.message_handler(commands=["start"])
-def start(m):
-    save_user(m.chat.id)
-    bot.reply_to(m, "Bot Ready")
 
-@bot.message_handler(commands=["analyze"])
-def analyze(m):
-    sym = extract_symbol(m.text)
-    data = market_data(sym)
 
-    if not data:
-        bot.reply_to(m, "No data")
-        return
+def extract_symbol(text):
+for w in re.findall(r'\b\w+\b', text.lower()):
+if w in ASSETS_DICTIONARY:
+return ASSETS_DICTIONARY[w]
+return "BTC"
 
-    bot.reply_to(m,
-        f"{sym}\nPrice: {data['price']}\nRSI: {data['rsi']}\nSupport: {data['support']}\nResistance: {data['resistance']}"
-    )
-
-# ================= RUN =================
+================== SAFE START ==================
 
 def run():
-    print("STARTING...")
+print("🔥 STARTING SERVER...")
 
-    set_webhook()
+print("🧪 TEST BOT GET UPDATES (should NOT run polling)")  
+print("THREAD MODE DISABLED -> WEBHOOK ONLY")  
 
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+set_webhook()  
 
-if __name__ == "__main__":
-    run()
+app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+if name == "main":
+run() 
