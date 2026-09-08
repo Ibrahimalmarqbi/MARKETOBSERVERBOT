@@ -18,11 +18,33 @@ import matplotlib.pyplot as plt
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
-print("TOKEN LOADED:", bool(TELEGRAM_TOKEN))
-print("WEBHOOK LOADED:", WEBHOOK_URL)
+print("🧠 BOOTING BOT...")
+print("TOKEN EXISTS:", bool(TELEGRAM_TOKEN))
+print("WEBHOOK URL:", WEBHOOK_URL)
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
+if not TELEGRAM_TOKEN:
+    raise Exception("NO TELEGRAM TOKEN FOUND")
+
+bot = telebot.TeleBot(
+    TELEGRAM_TOKEN,
+    threaded=False,        # مهم: يمنع threads العشوائية
+    skip_pending=True
+)
+
 DB_NAME = "market_pro.db"
+
+# ================== DEBUG GUARD ==================
+INSTANCE_FLAG = False
+
+def single_instance_guard():
+    global INSTANCE_FLAG
+    if INSTANCE_FLAG:
+        print("🚨 DUPLICATE INSTANCE DETECTED - EXITING")
+        os._exit(0)
+    INSTANCE_FLAG = True
+    print("✅ SINGLE INSTANCE LOCK OK")
+
+single_instance_guard()
 
 # ================== ASSETS ==================
 ASSETS_DICTIONARY = {
@@ -34,6 +56,7 @@ ASSETS_DICTIONARY = {
 
 # ================== DB ==================
 def init_db():
+    print("📦 INIT DB...")
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
@@ -51,6 +74,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+    print("✅ DB READY")
 
 init_db()
 
@@ -60,6 +84,7 @@ def save_user(chat_id):
     c.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
     conn.commit()
     conn.close()
+    print("👤 USER SAVED:", chat_id)
 
 def get_all_users():
     conn = sqlite3.connect(DB_NAME)
@@ -69,72 +94,30 @@ def get_all_users():
     conn.close()
     return users
 
-# ================== 3-LAYER MARKET DATA ==================
+# ================== MARKET DATA ==================
 def fetch_klines(symbol):
     symbol = symbol.upper()
-    print("Fetching:", symbol)
+    print("📡 FETCH:", symbol)
 
-    # ========== LAYER 1: BINANCE ==========
     try:
         url = "https://api.binance.com/api/v3/klines"
-        params = {
-            "symbol": f"{symbol}USDT",
-            "interval": "1h",
-            "limit": 200
-        }
+        params = {"symbol": f"{symbol}USDT", "interval": "1h", "limit": 100}
         headers = {"User-Agent": "Mozilla/5.0"}
 
         res = requests.get(url, params=params, headers=headers, timeout=5)
-
         print("BINANCE STATUS:", res.status_code)
 
-        if res.status_code == 200:
-            data = res.json()
-            if isinstance(data, list):
-                print("BINANCE OK")
-                return [float(c[4]) for c in data]
+        data = res.json()
+
+        if isinstance(data, list):
+            print("BINANCE OK DATA")
+            return [float(c[4]) for c in data]
+
+        print("BINANCE BAD RESPONSE:", data)
 
     except Exception as e:
         print("BINANCE ERROR:", e)
 
-    # ========== LAYER 2: CRYPTOCOMPARE ==========
-    try:
-        url = "https://min-api.cryptocompare.com/data/v2/histohour"
-        params = {
-            "fsym": symbol,
-            "tsym": "USD",
-            "limit": 200
-        }
-
-        res = requests.get(url, params=params, timeout=5)
-        data = res.json()
-
-        candles = data.get("Data", {}).get("Data", [])
-
-        if candles:
-            print("CRYPTOCOMPARE OK")
-            return [float(c["close"]) for c in candles]
-
-    except Exception as e:
-        print("CRYPTOCOMPARE ERROR:", e)
-
-    # ========== LAYER 3: YFINANCE ==========
-    try:
-        import yfinance as yf
-
-        ticker = f"{symbol}-USD"
-        print("YFINANCE:", ticker)
-
-        df = yf.download(ticker, period="7d", interval="1h", progress=False)
-
-        if df is not None and not df.empty:
-            print("YFINANCE OK")
-            return df["Close"].tolist()
-
-    except Exception as e:
-        print("YFINANCE ERROR:", e)
-
-    print("ALL SOURCES FAILED:", symbol)
     return None
 
 # ================== RSI ==================
@@ -163,138 +146,99 @@ def get_market_indicators(symbol):
     closes = fetch_klines(symbol)
 
     if not closes:
+        print("❌ NO MARKET DATA:", symbol)
         return None
 
     price = closes[-1]
+    rsi = calculate_rsi(closes)
+
+    print("📊 DATA OK:", symbol, price, rsi)
 
     return {
         "symbol": symbol,
         "price": price,
-        "rsi": calculate_rsi(closes),
+        "rsi": rsi,
         "support": price * 0.988,
         "resistance": price * 1.012
     }
-
-# ================== CHART ==================
-def generate_chart(symbol):
-    closes = fetch_klines(symbol)
-
-    if not closes:
-        return None
-
-    plt.figure(figsize=(8, 4))
-    plt.plot(closes[-40:])
-    plt.title(symbol)
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
-
-    return buf
-
-# ================== ALERT LOOP ==================
-def check_alerts():
-    while True:
-        try:
-            conn = sqlite3.connect(DB_NAME)
-            c = conn.cursor()
-
-            c.execute("SELECT id, chat_id, symbol, target_price, condition FROM alerts WHERE status='active'")
-            alerts = c.fetchall()
-
-            for id_, chat_id, symbol, target, cond in alerts:
-                data = get_market_indicators(symbol)
-                if not data:
-                    continue
-
-                price = data["price"]
-
-                if (cond == "below" and price <= target) or (cond == "above" and price >= target):
-                    try:
-                        bot.send_message(chat_id, f"🔔 {symbol} hit {price}")
-                        c.execute("UPDATE alerts SET status='done' WHERE id=?", (id_,))
-                        conn.commit()
-                    except Exception as e:
-                        print("SEND ERROR:", e)
-
-            conn.close()
-
-        except Exception as e:
-            print("ALERT LOOP ERROR:", e)
-
-        time.sleep(30)
-
-# ================== TELEGRAM ==================
-@bot.message_handler(commands=['start'])
-def start(m):
-    save_user(m.chat.id)
-    bot.reply_to(m, "Bot ready")
-
-@bot.message_handler(commands=['analyze'])
-def analyze(m):
-    sym = "BTC"
-    data = get_market_indicators(sym)
-
-    if not data:
-        bot.reply_to(m, "❌ no data")
-        return
-
-    bot.reply_to(m, f"""
-{sym}
-Price: {data['price']}
-RSI: {data['rsi']}
-Support: {data['support']}
-Resistance: {data['resistance']}
-""")
-
-@bot.message_handler(commands=['chart'])
-def chart(m):
-    sym = "BTC"
-    img = generate_chart(sym)
-
-    if not img:
-        bot.reply_to(m, "❌ no chart")
-        return
-
-    bot.send_photo(m.chat.id, img)
 
 # ================== FLASK ==================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Running"
+    print("🌐 HOME HIT")
+    return "BOT RUNNING"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        update = types.Update.de_json(request.get_data().decode("utf-8"))
+        print("📩 WEBHOOK HIT")
+
+        json_str = request.get_data().decode("utf-8")
+        update = types.Update.de_json(json_str)
+
+        print("➡️ UPDATE RECEIVED")
         bot.process_new_updates([update])
+
     except Exception as e:
-        print("WEBHOOK ERROR:", e)
+        print("❌ WEBHOOK ERROR:", e)
 
     return "OK"
 
-# ================== WEBHOOK ==================
+# ================== WEBHOOK SET ==================
 def set_webhook():
     try:
-        if WEBHOOK_URL:
-            bot.remove_webhook()
-            time.sleep(1)
-            bot.set_webhook(url=WEBHOOK_URL)
-            print("WEBHOOK SET OK")
+        print("🔄 RESET WEBHOOK...")
+
+        bot.remove_webhook()
+        time.sleep(2)
+
+        bot.set_webhook(url=WEBHOOK_URL)
+
+        print("✅ WEBHOOK ACTIVE:", WEBHOOK_URL)
+
     except Exception as e:
-        print("WEBHOOK ERROR:", e)
+        print("❌ WEBHOOK SET ERROR:", e)
 
-# ================== RUN ==================
+# ================== TELEGRAM HANDLERS ==================
+@bot.message_handler(commands=['start'])
+def start(m):
+    print("🚀 START CMD:", m.chat.id)
+    save_user(m.chat.id)
+    bot.reply_to(m, "Bot Ready")
+
+@bot.message_handler(commands=['analyze'])
+def analyze(m):
+    print("📊 ANALYZE:", m.text)
+
+    sym = extract_symbol(m.text)
+    data = get_market_indicators(sym)
+
+    if not data:
+        bot.reply_to(m, "No data")
+        return
+
+    bot.reply_to(m,
+        f"{sym}\nPrice: {data['price']}\nRSI: {data['rsi']}\nSupport: {data['support']}\nResistance: {data['resistance']}"
+    )
+
+def extract_symbol(text):
+    for w in re.findall(r'\b\w+\b', text.lower()):
+        if w in ASSETS_DICTIONARY:
+            return ASSETS_DICTIONARY[w]
+    return "BTC"
+
+# ================== SAFE START ==================
 def run():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    print("🔥 STARTING SERVER...")
 
-if __name__ == "__main__":
-    threading.Thread(target=run, daemon=True).start()
-    threading.Thread(target=check_alerts, daemon=True).start()
+    print("🧪 TEST BOT GET UPDATES (should NOT run polling)")
+    print("THREAD MODE DISABLED -> WEBHOOK ONLY")
 
     set_webhook()
 
-    print("BOT RUNNING FULL VERSION")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+if __name__ == "__main__":
+    run()
