@@ -233,34 +233,6 @@ bot.reply_to(m,
     f"{sym}\nPrice: {data['price']}\nRSI: {data['rsi']}\nSupport: {data['support']}\nResistance: {data['resistance']}"  
 )
 
-
-
-@bot.message_handler(commands=['broadcast'])
-def broadcast(m):
-    text = m.text.replace('/broadcast', '').strip()
-
-    if not text:
-        bot.reply_to(m, "اكتب الرسالة بعد الأمر")
-        return
-
-    users = get_all_users()
-
-    sent = 0
-    failed = 0
-
-    for chat_id in users:
-        try:
-            bot.send_message(chat_id, text)
-            sent += 1
-        except Exception as e:
-            print("BROADCAST ERROR:", chat_id, e)
-            failed += 1
-
-    bot.reply_to(m, f"Done\nSent: {sent}\nFailed: {failed}")
-
-
-
-
 def extract_symbol(text):
 for w in re.findall(r'\b\w+\b', text.lower()):
 if w in ASSETS_DICTIONARY:
