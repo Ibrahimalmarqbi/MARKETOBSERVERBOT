@@ -215,6 +215,30 @@ def set_alert(m):
     except:
         bot.reply_to(m, "Usage: /alert btc above 30000")
 
+# ================== BROADCAST ==================
+@bot.message_handler(commands=['broadcast'])
+def broadcast(m):
+    try:
+        msg = m.text.replace("/broadcast", "").strip()
+
+        users = get_all_users()
+
+        sent = 0
+        failed = 0
+
+        for user in users:
+            try:
+                bot.send_message(user, msg)
+                sent += 1
+                time.sleep(0.05)
+            except:
+                failed += 1
+
+        bot.reply_to(m, f"✅ Sent: {sent}\n❌ Failed: {failed}")
+
+    except Exception as e:
+        bot.reply_to(m, f"Error: {e}")
+
 # ================== FLASK ==================
 app = Flask(__name__)
 
