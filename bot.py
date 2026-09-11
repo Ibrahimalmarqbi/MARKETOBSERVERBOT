@@ -1,3 +1,8 @@
+# LEGACY STANDALONE SCRIPT — not used by the deployment.
+# render.yaml starts `python app.py`, which owns the Telegram token (long polling)
+# and the real user table in DATABASE_URL. This file keeps its own throwaway
+# `users.db` and sets a webhook, so it cannot see app.py users and the two cannot
+# receive updates at the same time. Use `/broadcast` in app.py instead.
 import os
 import time
 import sqlite3
@@ -122,16 +127,22 @@ def broadcast(m):
     text = m.text.replace("/broadcast", "").strip()
     users = get_users()
 
+    if not text:
+        bot.reply_to(m, "Usage: /broadcast <text>")
+        return
+
     count = 0
+    failed = 0
     for u in users:
         try:
             bot.send_message(u, text)
             count += 1
             time.sleep(0.05)
-        except:
-            continue
+        except Exception as e:
+            failed += 1
+            print(f"BROADCAST FAILED chat_id={u} error={e}")
 
-    bot.reply_to(m, f"Sent to {count}")
+    bot.reply_to(m, f"Sent to {count}/{len(users)} (failed {failed})")
 
 # ================= RUN =================
 
