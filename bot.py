@@ -8,6 +8,9 @@ import time
 import sqlite3
 import requests
 import re
+import websocket
+import json
+import time
 
 from flask import Flask, request
 import telebot
@@ -54,16 +57,50 @@ init_db()
 
 # ================= MARKET =================
 
-def get_price(symbol):
+
+_cache = {}  # نخزن آخر سعر مؤقتًا
+
+def get_price(symbol: str) -> float | None:
+    symbol = symbol.lower()
+
+    # ========= 1) كاش سريع =========
+    if symbol in _cache:
+        last_price, last_time = _cache[symbol]
+
+        # إذا السعر حديث أقل من 3 ثواني نرجعه مباشرة
+        if time.time() - last_time < 3:
+            return last_price
+
+    # ========= 2) WebSocket (السعر الحقيقي) =========
+    url = f"wss://stream.binance.com:9443/ws/{symbol}usdt@trade"
+
+    result = {"price": None}
+
+    def on_message(ws, message):
+        data = json.loads(message)
+        price = float(data["p"])
+
+        result["price"] = price
+        _cache[symbol] = (price, time.time())
+
+        ws.close()
+
+    def on_error(ws, error):
+        ws.close()
+
     try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": f"{symbol}USDT"},
-            timeout=5
+        ws = websocket.WebSocketApp(
+            url,
+            on_message=on_message,
+            on_error=on_error
         )
-        return float(r.json()["price"])
+
+        ws.run_forever()
+
     except:
-        return None
+        pass
+
+    return result["price"]
 
 # ================= FLASK =================
 
