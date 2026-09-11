@@ -712,6 +712,7 @@ def paper_order_cmd(message: types.Message):
 
 
 TELEGRAM_TEXT_LIMIT = 4096
+TELEGRAM_CAPTION_LIMIT = 1024
 # Telegram allows roughly 30 messages per second bot-wide; stay clearly under it.
 BROADCAST_SEND_DELAY_SECONDS = 0.035
 
@@ -781,16 +782,67 @@ def broadcast_text(text: str, chat_ids: list[int] | None = None, delay: float = 
     return {"users": len(chat_ids), "sent": sent, "failed": failed, "deactivated": deactivated}
 
 
+def broadcast_photo(photo, caption: str, chat_ids: list[int] | None = None, delay: float = BROADCAST_SEND_DELAY_SECONDS) -> dict[str, int]:
+    """Send a file_id, URL or file-like photo, caching its first successful file_id."""
+    caption = caption or ""
+    photo_caption = caption[:TELEGRAM_CAPTION_LIMIT]
+    overflow = caption[TELEGRAM_CAPTION_LIMIT:]
+    # Slice without stripping/reordering so the full caption survives the split.
+    chunks = [overflow[i:i + TELEGRAM_TEXT_LIMIT] for i in range(0, len(overflow), TELEGRAM_TEXT_LIMIT)]
+    if chat_ids is None:
+        chat_ids = [user.chat_id for user in db.broadcast_users()]
+    file_id = photo if isinstance(photo, str) and not photo.lower().startswith(("http://", "https://")) else None
+    upload_position = photo.tell() if hasattr(photo, "seekable") and photo.seekable() else None
+    sent = failed = deactivated = 0
+    for chat_id in chat_ids:
+        try:
+            if file_id is None and upload_position is not None:
+                photo.seek(upload_position)
+            message = bot.send_photo(chat_id, file_id if file_id is not None else photo, caption=photo_caption)
+            if file_id is None:
+                # Cache before sending overflow: a text failure must not trigger a re-upload.
+                file_id = message.photo[-1].file_id
+            for chunk in chunks:
+                if delay:
+                    time.sleep(delay)
+                bot.send_message(chat_id, chunk, disable_web_page_preview=True)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning("photo broadcast delivery failed chat_id=%s error=%s", chat_id, exc)
+            if blocked_by_user(exc):
+                db.set_user_active(chat_id, False)
+                deactivated += 1
+        if delay:
+            time.sleep(delay)
+    logger.info("photo broadcast finished: delivered %s of %s, failed %s, deactivated %s", sent, len(chat_ids), failed, deactivated)
+    return {"users": len(chat_ids), "sent": sent, "failed": failed, "deactivated": deactivated}
+
+
 @bot.message_handler(commands=["broadcast"])
 def broadcast_cmd(message: types.Message):
+    parts = (message.text or "").split(maxsplit=1)
+    text = parts[1].strip() if len(parts) > 1 else ""
+    run_broadcast_command(message, text)
+
+
+@bot.message_handler(content_types=["photo"])
+def broadcast_photo_cmd(message: types.Message):
+    # pyTelegramBotAPI's commands filter only matches text, never photo captions.
+    parts = (message.caption or "").split(maxsplit=1)
+    if not parts or parts[0].split("@", 1)[0] not in {"/broadcast", "/broadcast_photo"}:
+        return
+    caption = parts[1].strip() if len(parts) > 1 else ""
+    run_broadcast_command(message, caption, photo=message.photo[-1].file_id)
+
+
+def run_broadcast_command(message: types.Message, text: str, photo=None):
     lang = user_language(message)
     remember_user(message)
     if not is_admin_chat(message.chat.id):
         bot.reply_to(message, "هذا الأمر مخصص للمشرفين فقط." if lang == "ar" else "This command is restricted to admins.")
         return
-    parts = (message.text or "").split(maxsplit=1)
-    text = parts[1].strip() if len(parts) > 1 else ""
-    if not text:
+    if not text and photo is None:
         bot.reply_to(message, "الاستخدام: /broadcast نص الرسالة المراد إرسالها للجميع." if lang == "ar" else "Usage: /broadcast <message text>.")
         return
     pending = db.count_active_users()
@@ -798,7 +850,7 @@ def broadcast_cmd(message: types.Message):
         bot.reply_to(message, "لا يوجد مستخدمون نشطون مسجلون للإرسال." if lang == "ar" else "There are no active users to send to.")
         return
     bot.reply_to(message, f"جارٍ الإرسال إلى {pending} مستخدم نشط..." if lang == "ar" else f"Sending to {pending} active users...")
-    result = broadcast_text(text)
+    result = broadcast_photo(photo, text) if photo is not None else broadcast_text(text)
     if lang == "ar":
         summary = (f"وصلت الرسالة إلى {result['sent']} من {result['users']}. فشل الإرسال: {result['failed']}. "
                    f"تم تعطيل {result['deactivated']} مستخدم حظر البوت.")
@@ -1047,13 +1099,28 @@ def admin_broadcast():
     if not authorized():
         return jsonify({"error": "unauthorized"}), 401
     payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "payload must be a JSON object"}), 400
     text = str(payload.get("text", "")).strip()
-    if not text:
-        return jsonify({"error": "text is required"}), 400
+    photo_url = payload.get("photo_url")
+    photo_file_id = payload.get("photo_file_id")
+    for field in ("photo_url", "photo_file_id"):
+        if field in payload and (not isinstance(payload[field], str) or not payload[field].strip()):
+            return jsonify({"error": f"{field} must be a non-empty string"}), 400
+    if photo_url and photo_file_id:
+        return jsonify({"error": "provide only one of photo_url or photo_file_id"}), 400
+    photo = photo_file_id or photo_url
+    caption = payload.get("caption", text)
+    if photo is not None and not isinstance(caption, str):
+        return jsonify({"error": "caption must be a string"}), 400
+    if not text and photo is None:
+        return jsonify({"error": "text, photo_url or photo_file_id is required"}), 400
     chat_ids = payload.get("chat_ids")
     if chat_ids is not None:
         if not isinstance(chat_ids, list) or not all(isinstance(value, int) for value in chat_ids):
             return jsonify({"error": "chat_ids must be a list of integers"}), 400
+    if photo is not None:
+        return jsonify(broadcast_photo(photo.strip(), caption, chat_ids))
     return jsonify(broadcast_text(text, chat_ids))
 
 
