@@ -276,6 +276,15 @@ class Database:
         with self.session() as s:
             return list(s.scalars(select(User).order_by(User.created_at.desc()).limit(limit)).all())
 
+    def broadcast_users(self) -> list[User]:
+        """Every user still allowed to receive messages, oldest first."""
+        with self.session() as s:
+            return list(s.scalars(select(User).where(User.is_active.is_(True)).order_by(User.id.asc())).all())
+
+    def count_active_users(self) -> int:
+        with self.session() as s:
+            return len(s.scalars(select(User.id).where(User.is_active.is_(True))).all())
+
     def stats(self) -> dict[str, int]:
         with self.session() as s:
             return {

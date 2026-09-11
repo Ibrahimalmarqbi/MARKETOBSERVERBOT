@@ -1,9 +1,3 @@
-import os
-
-os.environ.setdefault("TELEGRAM_TOKEN", "123456:TEST_TOKEN")
-os.environ.setdefault("ADMIN_API_KEY", "test-admin-key")
-os.environ.setdefault("DATABASE_URL", "sqlite:///test-smoke.db")
-
 from app import app
 
 

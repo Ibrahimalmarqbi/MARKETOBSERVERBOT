@@ -4,11 +4,21 @@ import os
 from dataclasses import dataclass
 
 
+def parse_admin_chat_ids(raw: str) -> tuple[int, ...]:
+    """Parse ADMIN_CHAT_IDS such as '123456, 987654' into ints, ignoring junk."""
+    parsed = []
+    for part in (raw or "").replace(",", " ").split():
+        if part.lstrip("-").isdigit():
+            parsed.append(int(part))
+    return tuple(parsed)
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_token: str
     database_url: str
     admin_api_key: str
+    admin_chat_ids: tuple[int, ...]
     default_interval: str
     alert_poll_seconds: int
     signal_scan_seconds: int
@@ -41,6 +51,7 @@ class Settings:
             telegram_token=token,
             database_url=database_url,
             admin_api_key=admin_key,
+            admin_chat_ids=parse_admin_chat_ids(os.getenv("ADMIN_CHAT_IDS", "")),
             default_interval=os.getenv("DEFAULT_INTERVAL", "1h"),
             alert_poll_seconds=max(15, int(os.getenv("ALERT_POLL_SECONDS", "60"))),
             signal_scan_seconds=max(300, int(os.getenv("SIGNAL_SCAN_SECONDS", "900"))),

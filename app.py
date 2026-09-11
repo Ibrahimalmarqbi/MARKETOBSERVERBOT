@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 from flask import Flask, jsonify, request
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 
 from marketobserver.assets import ASSETS, Asset, resolve_asset
 from marketobserver.analysis import Analysis, analyze
@@ -54,6 +55,11 @@ app = Flask(__name__)
 AR = {
     "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، هل أدخل البيتكوين؟ أو احسب مخاطرة رأس المال 10000 بنسبة 1% دخول 4715 وقف 4690. يمكنك أيضًا استخدام /analyze و /alert و /risk و /paperbuy.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
+    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /analyze /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+}
+
+EN = {
+    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /analyze /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
 
 
@@ -705,10 +711,110 @@ def paper_order_cmd(message: types.Message):
         bot.reply_to(message, "حدث خطأ أثناء صفقة المحاكاة." if lang == "ar" else "Paper order failed.")
 
 
+TELEGRAM_TEXT_LIMIT = 4096
+# Telegram allows roughly 30 messages per second bot-wide; stay clearly under it.
+BROADCAST_SEND_DELAY_SECONDS = 0.035
+
+
+def split_broadcast_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Split an announcement into Telegram-sized chunks without losing content."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return [chunk for chunk in chunks if chunk]
+
+
+def is_admin_chat(chat_id: int) -> bool:
+    """Admins are configured by chat id in ADMIN_CHAT_IDS or hold role=admin."""
+    if chat_id in settings.admin_chat_ids:
+        return True
+    user = db.get_user(chat_id)
+    return bool(user and user.role == "admin")
+
+
+def blocked_by_user(exc: Exception) -> bool:
+    """True when Telegram says this chat can never receive messages again."""
+    if isinstance(exc, ApiTelegramException) and exc.error_code == 403:
+        return True
+    lowered = str(exc).lower()
+    return "bot was blocked" in lowered or "user is deactivated" in lowered or "chat not found" in lowered
+
+
+def broadcast_text(text: str, chat_ids: list[int] | None = None, delay: float = BROADCAST_SEND_DELAY_SECONDS) -> dict[str, int]:
+    """Deliver one announcement to every active user and report real outcomes."""
+    chunks = split_broadcast_text(text)
+    if not chunks:
+        return {"users": 0, "sent": 0, "failed": 0, "deactivated": 0}
+    if chat_ids is None:
+        chat_ids = [user.chat_id for user in db.broadcast_users()]
+    sent = failed = deactivated = 0
+    for chat_id in chat_ids:
+        try:
+            for chunk in chunks:
+                bot.send_message(chat_id, chunk, disable_web_page_preview=True)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning("broadcast delivery failed chat_id=%s error=%s", chat_id, exc)
+            if blocked_by_user(exc):
+                db.set_user_active(chat_id, False)
+                deactivated += 1
+        if delay:
+            time.sleep(delay)
+    logger.info("broadcast finished: delivered %s of %s, failed %s, deactivated %s", sent, len(chat_ids), failed, deactivated)
+    return {"users": len(chat_ids), "sent": sent, "failed": failed, "deactivated": deactivated}
+
+
+@bot.message_handler(commands=["broadcast"])
+def broadcast_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    if not is_admin_chat(message.chat.id):
+        bot.reply_to(message, "هذا الأمر مخصص للمشرفين فقط." if lang == "ar" else "This command is restricted to admins.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    text = parts[1].strip() if len(parts) > 1 else ""
+    if not text:
+        bot.reply_to(message, "الاستخدام: /broadcast نص الرسالة المراد إرسالها للجميع." if lang == "ar" else "Usage: /broadcast <message text>.")
+        return
+    pending = db.count_active_users()
+    if not pending:
+        bot.reply_to(message, "لا يوجد مستخدمون نشطون مسجلون للإرسال." if lang == "ar" else "There are no active users to send to.")
+        return
+    bot.reply_to(message, f"جارٍ الإرسال إلى {pending} مستخدم نشط..." if lang == "ar" else f"Sending to {pending} active users...")
+    result = broadcast_text(text)
+    if lang == "ar":
+        summary = (f"وصلت الرسالة إلى {result['sent']} من {result['users']}. فشل الإرسال: {result['failed']}. "
+                   f"تم تعطيل {result['deactivated']} مستخدم حظر البوت.")
+    else:
+        summary = (f"Delivered to {result['sent']} of {result['users']}. Failed: {result['failed']}. "
+                   f"Deactivated {result['deactivated']} blocked users.")
+    bot.reply_to(message, summary)
+
+
 @bot.message_handler(content_types=["text"])
 def text_cmd(message: types.Message):
     text = (message.text or "").strip()
     if text.startswith("/"):
+        # Never swallow an unknown command silently; say it was not handled.
+        lang = user_language(message)
+        bot.reply_to(message, AR["unknown_command"] if lang == "ar" else EN["unknown_command"])
         return
     user = db.get_user(message.chat.id)
     request = parse_request(text, user.last_asset if user else None)
@@ -934,6 +1040,21 @@ def admin_user_active(chat_id: int):
     payload = request.get_json(silent=True) or {}
     ok = db.set_user_active(chat_id, bool(payload.get("active", True)))
     return jsonify({"updated": ok, "chat_id": chat_id, "active": bool(payload.get("active", True))})
+
+
+@app.post("/admin/broadcast")
+def admin_broadcast():
+    if not authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    chat_ids = payload.get("chat_ids")
+    if chat_ids is not None:
+        if not isinstance(chat_ids, list) or not all(isinstance(value, int) for value in chat_ids):
+            return jsonify({"error": "chat_ids must be a list of integers"}), 400
+    return jsonify(broadcast_text(text, chat_ids))
 
 
 @app.get("/admin")
