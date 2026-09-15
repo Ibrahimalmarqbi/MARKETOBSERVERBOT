@@ -78,7 +78,7 @@ def resolve_asset(text: str | None) -> Asset | None:
     # Permit an explicit uppercase ticker that is not in the catalog; Yahoo can
     # resolve many additional listed instruments without requiring a code change.
     for token in re.findall(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9.=^-]{0,9}(?![A-Za-z0-9])", raw):
-        if token in {"USD", "API", "RSI", "SMA", "ATR"}:
+        if token in {"USD", "API", "RSI", "SMA", "ATR", "FVG", "BOS", "CHOCH", "OB", "SMC", "HH", "HL", "LH", "LL", "PDH", "PDL", "RR", "TP", "SL"}:
             continue
         return Asset(token, token, token, "custom", token, "USD", 4)
     return None

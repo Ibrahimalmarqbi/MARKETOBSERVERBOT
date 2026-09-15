@@ -4,3 +4,6 @@ __pycache__/
 .pytest_cache/
 *.db
 *.sqlite3
+
+# local market-data dumps (never committed)
+data/

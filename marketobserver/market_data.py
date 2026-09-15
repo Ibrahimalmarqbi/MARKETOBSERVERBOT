@@ -13,6 +13,15 @@ from .assets import Asset
 
 logger = logging.getLogger(__name__)
 
+# Binance rejects some regions on api.binance.com while the public market data
+# mirror stays reachable; both serve the identical klines payload, so trying the
+# second host is a reliability fix and never a different data source.
+BINANCE_HOSTS = ("https://api.binance.com", "https://data-api.binance.vision")
+BINANCE_PAIRS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "PAXG": "PAXGUSDT"}
+BINANCE_INTERVALS = {"15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d"}
+KRAKEN_PAIRS = {"BTC": "XXBTZUSD", "ETH": "XETHZUSD", "SOL": "XSOLZUSD"}
+KRAKEN_INTERVALS = {"15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "1440"}
+
 
 class DataUnavailable(RuntimeError):
     pass
@@ -26,6 +35,9 @@ class Candle:
     low: float
     close: float
     volume: float
+    # Taker buy base volume, when the provider returns it. It lets the volume
+    # module read real aggressive buy/sell pressure instead of guessing flow.
+    buy_volume: float | None = None
 
 
 class MarketDataProvider:
@@ -46,12 +58,20 @@ class MarketDataProvider:
                 return cached[1]
 
         source = f"yahoo:{asset.provider_symbol}"
+        candles: list[Candle] = []
         if asset.asset_class == "crypto":
+            # Exchange klines are the reference feed for crypto: native 4h and
+            # 15m bars plus taker buy volume. Yahoo stays last so a blocked or
+            # rate-limited exchange host cannot silently redefine a timeframe.
             candles = self._binance(asset, interval, limit)
             if candles:
                 source = f"binance:{self._binance_pair(asset)}"
             else:
-                candles = self._yahoo(asset, interval, limit)
+                candles = self._kraken(asset, interval, limit)
+                if candles:
+                    source = f"kraken:{self._kraken_pair(asset)}"
+                else:
+                    candles = self._yahoo(asset, interval, limit)
         else:
             candles = self._yahoo(asset, interval, limit)
 
@@ -66,31 +86,88 @@ class MarketDataProvider:
         return self._source.get(asset_key)
 
     def _binance_pair(self, asset: Asset) -> str | None:
-        return {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "PAXG": "PAXGUSDT"}.get(asset.key)
+        if asset.key in BINANCE_PAIRS:
+            return BINANCE_PAIRS[asset.key]
+        # Other USD-quoted crypto listings map 1:1 onto Binance pairs
+        # (DOGE-USD -> DOGEUSDT) without needing a code change.
+        symbol = (asset.provider_symbol or "").upper()
+        if symbol.endswith("-USD"):
+            base = symbol[:-4]
+            if base and base.isalnum():
+                return f"{base}USDT"
+        return None
 
     def _binance(self, asset: Asset, interval: str, limit: int) -> list[Candle]:
         pair = self._binance_pair(asset)
-        if not pair:
+        timeframe = BINANCE_INTERVALS.get(interval)
+        if not pair or not timeframe:
+            return []
+        params = {"symbol": pair, "interval": timeframe, "limit": min(limit, 1000)}
+        for host in BINANCE_HOSTS:
+            try:
+                response = self.session.get(f"{host}/api/v3/klines", params=params, timeout=(3, 8))
+                if response.status_code != 200:
+                    logger.info("binance %s returned HTTP %s for %s", host, response.status_code, pair)
+                    continue
+                rows = response.json()
+                if not isinstance(rows, list):
+                    continue
+                candles: list[Candle] = []
+                for row in rows:
+                    if len(row) < 10:
+                        continue
+                    buy = float(row[9]) if row[9] not in (None, "") else None
+                    candles.append(Candle(
+                        timestamp=datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc),
+                        open=float(row[1]), high=float(row[2]), low=float(row[3]),
+                        close=float(row[4]), volume=float(row[5]), buy_volume=buy,
+                    ))
+                if candles:
+                    return candles
+            except (requests.RequestException, ValueError, TypeError, IndexError) as exc:
+                logger.warning("Binance data failed on %s for %s: %s", host, asset.key, exc)
+        return []
+
+    def _kraken_pair(self, asset: Asset) -> str | None:
+        if asset.key in KRAKEN_PAIRS:
+            return KRAKEN_PAIRS[asset.key]
+        symbol = (asset.provider_symbol or "").upper()
+        if symbol.endswith("-USD"):
+            base = symbol[:-4]
+            if base and base.isalnum():
+                return f"X{base}ZUSD"
+        return None
+
+    def _kraken(self, asset: Asset, interval: str, limit: int) -> list[Candle]:
+        """Second crypto venue. Kraken serves up to 720 bars, which covers the
+        4H/1H/15m windows this engine consumes."""
+        pair = self._kraken_pair(asset)
+        timeframe = KRAKEN_INTERVALS.get(interval)
+        if not pair or not timeframe:
             return []
         try:
             response = self.session.get(
-                "https://api.binance.com/api/v3/klines",
-                params={"symbol": pair, "interval": interval, "limit": min(limit, 1000)},
-                timeout=(3, 8),
+                "https://api.kraken.com/0/public/OHLC",
+                params={"pair": pair, "interval": timeframe},
+                timeout=(3, 10),
             )
             response.raise_for_status()
-            rows = response.json()
-            if not isinstance(rows, list):
+            payload = response.json()
+            rows = [row for row in payload.get("result", {}).values() if isinstance(row, list)]
+            if not rows:
                 return []
-            return [
-                Candle(
-                    timestamp=datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc),
+            candles: list[Candle] = []
+            for row in rows[-limit:]:
+                if len(row) < 7:
+                    continue
+                candles.append(Candle(
+                    timestamp=datetime.fromtimestamp(float(row[0]), tz=timezone.utc),
                     open=float(row[1]), high=float(row[2]), low=float(row[3]),
-                    close=float(row[4]), volume=float(row[5]),
-                ) for row in rows if len(row) >= 6
-            ]
-        except (requests.RequestException, ValueError, TypeError, IndexError) as exc:
-            logger.warning("Binance data failed for %s: %s", asset.key, exc)
+                    close=float(row[4]), volume=float(row[6]),
+                ))
+            return candles
+        except (requests.RequestException, ValueError, TypeError, KeyError, IndexError) as exc:
+            logger.warning("Kraken data failed for %s: %s", asset.key, exc)
             return []
 
     def _yahoo(self, asset: Asset, interval: str, limit: int) -> list[Candle]:
