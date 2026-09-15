@@ -31,6 +31,8 @@ from marketobserver.market_data import DataUnavailable, MarketDataProvider
 from marketobserver.research import MarketResearch, ResearchSnapshot, headline_fingerprint, headline_importance_level
 from marketobserver.risk import calculate_position_size
 from marketobserver.llm import GroundedLLM
+from marketobserver.smc import build_report as build_smc_report
+from marketobserver.smc_text import LANGS as SMC_LANGS, render as render_smc, render_brief as render_smc_brief, to_dict as smc_to_dict
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("marketobserver")
@@ -53,7 +55,7 @@ app = Flask(__name__)
 
 
 AR = {
-    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، هل أدخل البيتكوين؟ أو احسب مخاطرة رأس المال 10000 بنسبة 1% دخول 4715 وقف 4690. يمكنك أيضًا استخدام /analyze و /alert و /risk و /paperbuy.",
+    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، هل أدخل البيتكوين؟ أو احسب مخاطرة رأس المال 10000 بنسبة 1% دخول 4715 وقف 4690. يمكنك أيضًا استخدام /analyze و /smc (تحليل سيولة ذكية بأزرار) و /alert و /risk و /paperbuy.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
     "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /analyze /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
@@ -87,6 +89,22 @@ def education_response(lang: str, text: str, asset: Asset | None = None) -> str:
     if "وقف الخساره" in text or "وقف الخسارة" in text or "stop loss" in lowered:
         return ("وقف الخسارة مستوى إلغاء للصفقة؛ يحدد مسبقًا النقطة التي يصبح عندها السيناريو غير صالح. لا تضعه عشوائيًا، واحسب حجم الصفقة بحيث لا تتجاوز الخسارة المحتملة نسبة المخاطرة المسموح بها."
                 if lang == "ar" else "A stop loss is a pre-defined invalidation level for a trade. It should be placed based on the market structure, not randomly, and position size should keep the potential loss within your risk limit.")
+    if "سيوله" in lowered or "السيولة" in text or "liquidity" in lowered:
+        return ("السيولة هي حجم الأوامر المعلّقة عند مستوى سعري. يتحرك السعر غالبًا نحو القمم أو القيعان المتساوية وأطراف الشموع الطويلة لأنها مواضع تجمع أوامر وقف الخسارة؛ كسر سيولة بذيل فقط لا يعتبر كسر هيكل. لا تُتداول السيولة منفردة بل مع الاتجاه وتأكيد الإغلاق والحجم."
+                if lang == "ar" else
+                "Liquidity is the resting orders stacked at a price area. Price is often drawn to equal highs/lows and long wicks because that is where stop orders cluster; a wick-only run is a sweep, not a structure break. Liquidity is never traded alone: it needs trend, closing confirmation and volume.")
+    if "اوردر بلوك" in lowered or "بلوك الاوامر" in lowered or "order block" in lowered:
+        return ("أوردر بلوك هو آخر شمعة معاكسة قبل حركة إزاحة كسرت الهيكل؛ تُرسم من قاع/قمة تلك الشمعة وتبقى صالحة حتى إغلاق يخترقها. الأفضل أن تكون غير مختبرة (fresh) وأن تتكون بعد صيد سيولة، مع وقف خلفها مباشرة."
+                if lang == "ar" else
+                "An order block is the last opposing candle before the displacement leg that broke structure. It is drawn from that candle's range and stays valid until a close passes through it. Prefer a fresh, unmitigated block formed after a liquidity sweep, with the stop just beyond it.")
+    if "فجوه سعريه" in lowered or "فجوات سعريه" in lowered or "fair value gap" in lowered or "fvg" in lowered:
+        return ("الفجوة السعرية (FVG) هي فراغ ثلاث شموع لا يجد فيه السعر تداولًا متوازنًا؛ تُقاس بنهاية الشمعة الأولى وبداية الثالثة. تُستخدم كمنطقة اهتمام، وكلما قلّ امتلاؤها كانت أنظف؛ الفجوة الممتلئة أكثر من 60% تفقد قيمتها."
+                if lang == "ar" else
+                "A fair value gap is a three-candle imbalance where trade was one-sided. It is measured between the first candle's extreme and the third candle's opposite extreme. A lightly filled gap is cleaner; once it is filled beyond roughly 60% it loses its value as a point of interest.")
+    if "bос" in lowered or "bos" in lowered or "كسر الهيكل" in lowered or "choch" in lowered or "تغير الشخصيه" in lowered:
+        return ("BOS هو إغلاق شمعة خارج آخر قمة أو قاع مؤكد في اتجاه الهيكل الحالي، بينما CHoCH هو أول إغلاق عكس الهيكل ويقرأ كإنذار انعكاس لا كدخول. الذيل الذي يخترق المستوى ثم يعود الإغلاق للداخل يسمى صيد سيولة ولا يُحسب كسرًا."
+                if lang == "ar" else
+                "BOS is a candle closing beyond the last confirmed high or low in the direction of the current structure. CHoCH is the first close against it and is read as an early reversal warning, not an entry. A wick through a level with the close back inside is a liquidity sweep, never a break.")
     if "دعم" in text or "مقاومه" in text or "مقاومة" in text or "support" in lowered or "resistance" in lowered:
         return ("الدعم منطقة قد يظهر عندها طلب، والمقاومة منطقة قد يظهر عندها عرض. هما منطقتان وليستا خطين مضمونين؛ يلزم انتظار تأكيد من السعر والحجم أو الإغلاق قبل اعتبار الكسر حقيقيًا."
                 if lang == "ar" else "Support is an area where demand may appear, while resistance is an area where supply may appear. They are zones, not guaranteed lines; wait for price and, when available, volume or close confirmation before treating a breakout as real.")
@@ -393,7 +411,15 @@ def send_localized(chat_id: int, lang: str, ar: str, en: str):
 @bot.message_handler(commands=["start", "help"])
 def start_cmd(message: types.Message):
     remember_user(message)
-    bot.reply_to(message, AR["start"] if user_language(message) == "ar" else "Welcome. Use /analyze BTC, /alert below BTC 60000, /risk, and /paperbuy for paper trading.")
+    # The smart-money buttons are part of the entry point so the two ways of
+    # driving the system (typed commands and taps) are discoverable together.
+    language = user_language(message)
+    remembered = db.get_user(message.chat.id)
+    quick_asset = remembered.last_asset if remembered and remembered.last_asset else "BTC"
+    bot.reply_to(message, AR["start"] if language == "ar" else (
+        "Welcome. Use /analyze BTC, /smc BTC (multi-timeframe smart-money report with buttons), "
+        "/alert below BTC 60000, /risk, and /paperbuy for paper trading."),
+        reply_markup=smc_keyboard(quick_asset, language, "full"))
 
 
 def signal_text(rows, lang: str, tz_name: str) -> str:
@@ -711,6 +737,344 @@ def paper_order_cmd(message: types.Message):
         bot.reply_to(message, "حدث خطأ أثناء صفقة المحاكاة." if lang == "ar" else "Paper order failed.")
 
 
+# ============================ SMART MONEY (SMC) ============================ #
+# Deterministic multi-timeframe detection lives in marketobserver/smc.py.
+# Nothing in this layer invents a number: the engine reads real OHLCV only and
+# the report text is assembled from its structured output.
+
+SMC_TIMEFRAMES = ("4h", "1h", "15m")
+SMC_PRIMARY_ASSETS = ("BTC", "ETH", "SOL", "XAUUSD", "EURUSD", "WTI")
+SMC_MORE_ASSETS = ("PAXG", "XAGUSD", "BRENT", "NATGAS", "DXY", "AAPL", "TSLA", "NVDA", "QQQ")
+SMC_MODES = ("brief", "full")
+# Per-chat UI preference. The process is single-worker by design (Telegram
+# polling and the alert loop run in this process), so an in-memory dict is the
+# right size of state for button labels; losing it only resets button highlighting.
+smc_prefs: dict[int, dict[str, str]] = {}
+smc_reports: dict[str, tuple[float, object]] = {}
+SMC_REPORT_TTL_SECONDS = 40
+
+
+def smc_lang_for(message: types.Message, chat_id: int | None = None) -> str:
+    """Persisted language choice wins, otherwise detect from the message."""
+    if chat_id is None and message is not None:
+        chat_id = message.chat.id
+    stored = (smc_prefs.get(chat_id or 0) or {}).get("lang")
+    if stored in ("ar", "en", "both"):
+        return stored
+    return user_language(message) if message is not None else "ar"
+
+
+def smc_build_report(asset: Asset, force: bool = False):
+    """Fetch the three timeframes and run the detector once.
+
+    4H and 1H are mandatory; 15m is required for entry timing and its absence is
+    reported by the engine instead of being papered over with another timeframe.
+    Returns (report, candles_by_timeframe) so the chart can reuse the same real
+    candles without a second provider call.
+    """
+    key = f"{asset.key}:{'1' if force else '0'}"
+    cached = smc_reports.get(key)
+    if cached and not force and time.time() - cached[0] < SMC_REPORT_TTL_SECONDS:
+        return cached[1]
+    candles_by_timeframe: dict[str, list] = {}
+    for timeframe in SMC_TIMEFRAMES:
+        try:
+            candles_by_timeframe[timeframe] = market.get_candles(asset, timeframe, 200)
+        except DataUnavailable:
+            continue
+    if "4h" not in candles_by_timeframe or "1h" not in candles_by_timeframe:
+        raise DataUnavailable(f"SMC needs 4H and 1H candles for {asset.key}")
+    report = build_smc_report(asset.key, asset.name_ar, asset.name_en, asset.quote, asset.price_decimals,
+                          candles_by_timeframe, market.last_source(asset.key) or "unknown")
+    payload = (report, candles_by_timeframe)
+    smc_reports[key] = (time.time(), payload)
+    return payload
+
+
+def smc_keyboard(asset_key: str, lang: str, mode: str) -> types.InlineKeyboardMarkup:
+    """Inline buttons: pick asset, switch language, switch detail, refresh,
+    chart, zone alerts and the measurement rules. Every button carries the
+    current asset/lang/mode so pressing one never loses context."""
+    mode = mode if mode in SMC_MODES else "full"
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    names = {"BTC": "₿ BTC", "ETH": "Ξ ETH", "SOL": "◎ SOL", "XAUUSD": "🥇 XAU", "EURUSD": "💶 EUR", "WTI": "🛢 WTI",
+             "PAXG": "🥈 PAXG", "XAGUSD": "⚪️ XAG", "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS", "DXY": "💵 DXY",
+             "AAPL": "🍎 AAPL", "TSLA": "🚗 TSLA", "NVDA": "🎮 NVDA", "QQQ": "📈 QQQ"}
+    for row in (SMC_PRIMARY_ASSETS[:3], SMC_PRIMARY_ASSETS[3:]):
+        keyboard.add(*[types.InlineKeyboardButton(("✅ " if key == asset_key else "") + names.get(key, key),
+                                                  callback_data=f"smc:asset:{key}:{lang}:{mode}") for key in row])
+    keyboard.add(types.InlineKeyboardButton("أصول أخرى +" if lang == "ar" else "More assets +",
+                                           callback_data=f"smc:more:{asset_key}:{lang}:{mode}"))
+    keyboard.add(
+        types.InlineKeyboardButton("⚡ مختصر" if lang == "ar" else "⚡ Brief", callback_data=f"smc:mode:{asset_key}:{lang}:brief"),
+        types.InlineKeyboardButton("📋 تقرير كامل" if lang == "ar" else "📋 Full report", callback_data=f"smc:mode:{asset_key}:{lang}:full"),
+        types.InlineKeyboardButton("🔄 إعادة حساب" if lang == "ar" else "🔄 Recompute", callback_data=f"smc:report:{asset_key}:{lang}:{mode}:1"),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton("🇸🇦 عربي", callback_data=f"smc:lang:{asset_key}:ar:{mode}"),
+        types.InlineKeyboardButton("🇬🇧 English", callback_data=f"smc:lang:{asset_key}:en:{mode}"),
+        types.InlineKeyboardButton("🌐 عربي + English" if lang == "ar" else "🌐 AR + EN", callback_data=f"smc:lang:{asset_key}:both:{mode}"),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton("📊 شارت موسوم" if lang == "ar" else "📊 Annotated chart", callback_data=f"smc:chart:{asset_key}:{lang}:{mode}"),
+        types.InlineKeyboardButton("🔔 راقب المنطقة" if lang == "ar" else "🔔 Watch zone", callback_data=f"smc:alert:{asset_key}:{lang}:{mode}"),
+    )
+    keyboard.add(types.InlineKeyboardButton("🧮 كيف قِستُ (BOS/CHoCH/OB/FVG)" if lang == "ar" else "🧮 How it is measured",
+                                            callback_data=f"smc:rules:{asset_key}:{lang}:{mode}"))
+    return keyboard
+
+
+SMC_RULES_AR = (
+    "كيف تُكتَب النتائج (كل شيء حسابي، لا LLM):\n"
+    "• الهيكل: نقاط ارتكاز Fractal بنافذة شمعتين على كل جانب؛ الوسم لا يُعتمد إلا بعد إقفال الشمعتين التاليتين — لا استخدام لمستقبل البيانات.\n"
+    "• BOS: إغلاق جسم شمعة فوق آخر قمة مرتكز (للشراء) أو تحت آخر قاع (للبيع) مع كون الاتجاه على 4H في نفس الجهة.\n"
+    "• CHoCH: أول إغلاق معاكس للاتجاه السائد؛ يُستخدم كإنذار مبكر للانعكاس وليس كدخول.\n"
+    "• صيد السيولة: ذيل يخترق القمة/القاع ثم يعود الإغلاق للداخل — لا يُعامل ككسر أبدًا.\n"
+    "• OB: آخر شمعة معاكسة قبل حركة الإزاحة التي صنعت الكسر، وتبقى صالحة حتى إغلاق خلفها.\n"
+    "• FVG: فجوة ثلاث شموع بعرض ≥ 0.30 ATR؛ تُحسب نسبة التعبئة ولا تُقبل منطقة مُلأت ≥ 60%.\n"
+    "• الشموع: مطرقة/مقلوبتها/نجمة ساقطة = ذيل ≥ ضعفي الجسم؛ ابتلاعي = جسم يغلق فوق/تحت جسم السابقة مع كبره؛ نجمة صباح/مساء = ثلاث شموع بشروط وسطى صارمة؛ دوجي = جسم ≤ 10% من المدى. كل نمط يُذكر مع موضعه من المنطقة، لا منفردًا.\n"
+    "• الحجم: RVOL وارتفاعات ≥ 2.2x ونسبة الشراء العدواني من Binance (taker buy) وشكل OBV.\n"
+    "• القرار: كل البوابات (اتجاه 4H + تأكيد 15m + السعر داخل المنطقة + عدم المطاردة + إشارة شمعة + حجم + RR ≥ 1:2) يجب أن تنجح؛ وإلا WAIT."
+)
+SMC_RULES_EN = (
+    "How the numbers are produced (all arithmetic, no LLM):\n"
+    "• Structure: fractal pivots, 2 candles on each side; a pivot only counts after those two candles close — no look-ahead.\n"
+    "• BOS: a candle *body* closes above the last swing high (long) or below the last swing low (short) while the 4H bias agrees.\n"
+    "• CHoCH: first close against the prevailing bias — an early warning, not an entry.\n"
+    "• Liquidity sweep: a wick through the level with the close back inside — never counted as a break.\n"
+    "• OB: last opposing candle before the displacement leg that broke structure; valid until a close passes it.\n"
+    "• FVG: 3-candle gap at least 0.30 ATR wide; gaps filled ≥ 60% are rejected.\n"
+    "• Candles: hammer/inverted/shooting star need a wick ≥ 2x body; engulfing must close beyond the prior body; stars use strict three-candle rules; doji body ≤ 10% of range. Each print is reported with its location, never standalone.\n"
+    "• Volume: RVOL, spikes ≥ 2.2x, Binance taker buy share, OBV shape.\n"
+    "• Decision: every gate (4H trend, 15m confirmation, price in zone, no chasing, candle trigger, volume, RR ≥ 1:2) must pass — otherwise WAIT."
+)
+
+
+def deliver_smc(chat_id: int, text: str, markup=None, edit_message_id: int | None = None) -> None:
+    """Send a report, splitting long output; edits in place when it fits."""
+    parts = split_broadcast_text(text, TELEGRAM_TEXT_LIMIT) or [text[:TELEGRAM_TEXT_LIMIT]]
+    if edit_message_id is not None and len(parts) == 1:
+        try:
+            bot.edit_message_text(parts[0], chat_id=chat_id, message_id=edit_message_id, reply_markup=markup)
+            return
+        except ApiTelegramException as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.info("smc edit fell back to send: %s", exc)
+    for index, part in enumerate(parts):
+        bot.send_message(chat_id, part, reply_markup=markup if index == len(parts) - 1 else None)
+
+
+def smc_respond(target_message, asset: Asset, lang: str, mode: str, force: bool = False, edit_message_id: int | None = None):
+    try:
+        report, _ = smc_build_report(asset, force=force)
+    except DataUnavailable:
+        deliver_smc(target_message.chat.id, "⛔ " + (AR["data_error"] if lang == "ar" else "Reliable market data is unavailable for this asset right now. No synthetic candles were used, so no analysis is produced."), edit_message_id=edit_message_id)
+        return None
+    except Exception:
+        logger.exception("smc analysis failed for %s", asset.key)
+        deliver_smc(target_message.chat.id, "⛔ " + ("تعذر إكمال التحليل مؤقتًا." if lang == "ar" else "Analysis could not be completed right now."), edit_message_id=edit_message_id)
+        return None
+    text = render_smc_brief(report, lang) if mode == "brief" else render_smc(report, lang)
+    deliver_smc(target_message.chat.id, text, smc_keyboard(asset.key, lang, mode), edit_message_id)
+    return report
+
+
+def parse_smc_arguments(text: str) -> tuple[str | None, str | None, str | None]:
+    """Hybrid command grammar: /smc [ASSET] [ar|en|both] [brief|full|chart].
+
+    Anything unrecognised is treated as the asset name so natural ticker styles
+    keep working ("/smc الذهب", "/smc BTC en full").
+    """
+    asset_token: str | None = None
+    lang: str | None = None
+    mode: str | None = None
+    for token in (text or "").split()[1:]:
+        lowered = token.lower().strip("/")
+        if lowered in ("ar", "en", "both"):
+            lang = lowered
+        elif lowered in ("brief", "full", "chart", "مختصر", "كامل", "شارت"):
+            mode = {"مختصر": "brief", "كامل": "full", "شارت": "chart"}.get(lowered, lowered)
+        elif asset_token is None:
+            asset_token = token
+    return asset_token, lang, mode
+
+
+@bot.message_handler(commands=["smc", "smartmoney", "sma", "ict"])
+def smc_cmd(message: types.Message):
+    supplied, lang_override, mode_override = parse_smc_arguments(message.text or "")
+    asset = selected_asset(message, supplied) if supplied else selected_asset(message)
+    remember_user(message, asset)
+    lang = lang_override or smc_lang_for(message)
+    if asset is None:
+        bot.reply_to(message, "اذكر الأصل مثل: /smc BTC أو /smc الذهب." if lang == "ar" else "Name an asset, for example /smc BTC or /smc gold.",
+                     reply_markup=smc_keyboard("BTC", lang, "full"))
+        return
+    prefs = smc_prefs.setdefault(message.chat.id, {})
+    mode = mode_override or prefs.get("mode", "full")
+    if mode == "chart":
+        try:
+            report, candles = smc_build_report(asset, force=True)
+            bot.send_chat_action(message.chat.id, "upload_photo")
+            bot.send_photo(message.chat.id, smc_chart(asset, report, candles), caption=render_smc_brief(report, lang),
+                           reply_markup=smc_keyboard(asset.key, lang, "full"))
+        except DataUnavailable:
+            bot.reply_to(message, AR["data_error"] if lang == "ar" else "Reliable market data is unavailable; no chart was invented.")
+        return
+    prefs["mode"] = mode
+    if lang_override:
+        prefs["lang"] = lang_override
+    smc_respond(message, asset, lang, mode, force=True)
+
+
+SMC_BUTTON_NAMES = {"BTC": "₿ BTC", "ETH": "Ξ ETH", "SOL": "◎ SOL", "PAXG": "🥈 PAXG", "XAUUSD": "🥇 XAU",
+                    "XAGUSD": "⚪️ XAG", "EURUSD": "💶 EUR", "WTI": "🛢 WTI", "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS",
+                    "DXY": "💵 DXY", "AAPL": "🍎 AAPL", "TSLA": "🚗 TSLA", "NVDA": "🎮 NVDA", "QQQ": "📈 QQQ"}
+
+
+def parse_smc_callback(data: str) -> tuple[str, str, str, str, bool]:
+    """`smc:<action>:<asset>:<lang>:<mode>[:1]` -> (action, asset, lang, mode, force).
+
+    Kept as a pure function so the routing can be unit-tested without Telegram.
+    """
+    fields = (data or "").split(":")
+    action = fields[1] if len(fields) > 1 and fields[1] else "report"
+    asset_key = fields[2] if len(fields) > 2 and fields[2] else "BTC"
+    lang = fields[3] if len(fields) > 3 and fields[3] in ("ar", "en", "both") else "ar"
+    mode = fields[4] if len(fields) > 4 and fields[4] in SMC_MODES else "full"
+    return action, asset_key, lang, mode, len(fields) > 5 and fields[5] == "1"
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("smc:")))
+def smc_callback(call: types.CallbackQuery):
+    action, asset_key, lang, mode, force = parse_smc_callback(call.data)
+    prefs = smc_prefs.setdefault(call.message.chat.id, {})
+    prefs.update({"lang": lang, "mode": mode, "asset": asset_key})
+    asset = ASSETS.get(asset_key) or resolve_asset(asset_key)
+    try:
+        if asset is None:
+            bot.answer_callback_query(call.id, "أصل غير معروف" if lang == "ar" else "Unknown asset", show_alert=True)
+            return
+        if action == "more":
+            keyboard = types.InlineKeyboardMarkup(row_width=3)
+            for row in (SMC_MORE_ASSETS[:3], SMC_MORE_ASSETS[3:6], SMC_MORE_ASSETS[6:]):
+                keyboard.add(*[types.InlineKeyboardButton(SMC_BUTTON_NAMES.get(key, key), callback_data=f"smc:asset:{key}:{lang}:{mode}") for key in row])
+            keyboard.add(types.InlineKeyboardButton("↩️ رجوع" if lang == "ar" else "↩️ Back", callback_data=f"smc:asset:{asset_key}:{lang}:{mode}"))
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=keyboard)
+            bot.answer_callback_query(call.id)
+            return
+        if action in ("lang", "mode"):
+            smc_respond(call.message, asset, lang, mode)
+            bot.answer_callback_query(call.id)
+            return
+        if action == "asset":
+            db.set_last_asset(call.message.chat.id, asset.key)
+            smc_respond(call.message, asset, lang, mode)
+            bot.answer_callback_query(call.id)
+            return
+        if action == "rules":
+            deliver_smc(call.message.chat.id, SMC_RULES_AR if lang == "ar" else SMC_RULES_EN, smc_keyboard(asset.key, lang, mode))
+            bot.answer_callback_query(call.id)
+            return
+        if action == "chart":
+            report, candles = smc_build_report(asset, force=force)
+            bot.send_chat_action(call.message.chat.id, "upload_photo")
+            bot.send_photo(call.message.chat.id, smc_chart(asset, report, candles), caption=render_smc_brief(report, lang),
+                           reply_markup=smc_keyboard(asset.key, lang, mode))
+            bot.answer_callback_query(call.id)
+            return
+        if action == "alert":
+            report, _ = smc_build_report(asset)
+            plan = report.plan
+            created = []
+            if plan.zone and plan.stop:
+                if plan.side == "long":
+                    created.append(db.add_alert(call.message.chat.id, asset.key, round(plan.stop, asset.price_decimals), "below"))
+                    created.append(db.add_alert(call.message.chat.id, asset.key, round(plan.target_one, asset.price_decimals), "above"))
+                else:
+                    created.append(db.add_alert(call.message.chat.id, asset.key, round(plan.stop, asset.price_decimals), "above"))
+                    created.append(db.add_alert(call.message.chat.id, asset.key, round(plan.target_one, asset.price_decimals), "below"))
+            if plan.zone:
+                created.append(db.add_alert(call.message.chat.id, asset.key, round(plan.entry_high if plan.side == "long" else plan.entry_low, asset.price_decimals),
+                                             "below" if plan.side == "long" else "above"))
+            if not created:
+                bot.answer_callback_query(call.id, "لا خطة صالحة لضبط تنبيه — القرار WAIT" if lang == "ar" else "No valid plan to alert on — decision is WAIT", show_alert=True)
+                return
+            text = (f"🔔 عُلّقت {len(created)} تنبيهات على خطة {asset.name_ar}: "
+                    + ", ".join(f"{alert.condition} {alert.target_price}" for alert in created)
+                    + " — ألغِ أيًّاها بـ /cancel_alert ID.") if lang == "ar" else (
+                f"🔔 {len(created)} alerts attached to the {asset.name_en} plan: "
+                + ", ".join(f"{alert.condition} {alert.target_price}" for alert in created)
+                + " — cancel any with /cancel_alert ID.")
+            deliver_smc(call.message.chat.id, text, smc_keyboard(asset.key, lang, mode))
+            bot.answer_callback_query(call.id)
+            return
+        # default: (re)draw the report
+        smc_respond(call.message, asset, lang, mode, force=force)
+        bot.answer_callback_query(call.id)
+    except DataUnavailable:
+        bot.answer_callback_query(call.id, "لا توجد بيانات موثوقة الآن" if lang == "ar" else "No reliable market data right now", show_alert=True)
+    except Exception:
+        logger.exception("smc callback failed")
+        bot.answer_callback_query(call.id, "تعذر تنفيذ الزر" if lang == "ar" else "Button failed", show_alert=True)
+
+
+def smc_chart(asset: Asset, report, candles_by_timeframe: dict):
+    """Annotated 4H chart drawn from the same real candles the engine used."""
+    candles = candles_by_timeframe.get("4h") or []
+    view = report.view("4h")
+    figure, axis = plt.subplots(figsize=(10, 6))
+    figure.patch.set_facecolor("#0b1220")
+    axis.set_facecolor("#111827")
+    window = candles[-110:]
+    for offset, candle in enumerate(window):
+        up = candle.close >= candle.open
+        color = "#22c55e" if up else "#ef4444"
+        axis.plot([offset, offset], [candle.low, candle.high], color=color, linewidth=0.8, zorder=2)
+        axis.add_patch(plt.Rectangle((offset - 0.32, min(candle.open, candle.close)), 0.64, max(abs(candle.close - candle.open), 1e-9),
+                                     color=color, alpha=0.95, zorder=3))
+    if view:
+        for level in sorted(view.levels, key=lambda item: item.strength, reverse=True)[:5]:
+            axis.axhline(level.price, color="#38bdf8", alpha=0.45, linewidth=1.0)
+            axis.text(len(window) + 0.5, level.price, f"{level.kind} {level.price:g}", color="#38bdf8", fontsize=7, va="center")
+        for event in view.events[-6:]:
+            position = event.index - (len(candles) - len(window))
+            if 0 <= position < len(window):
+                axis.annotate(event.label, (position, event.level), color="#fbbf24", fontsize=8, ha="center",
+                              va="bottom" if event.direction == "bullish" else "top")
+        plan = report.plan
+        # plan labels go inside the plot on the left; level labels live on the
+        # right edge, so the two never overlap on a narrow chart
+        inside = dict(ha="left", va="bottom", fontsize=7,
+                      bbox=dict(facecolor="#0b1220", edgecolor="none", alpha=0.6, pad=1.2))
+        if plan.zone:
+            axis.axhspan(plan.entry_low, plan.entry_high, color="#22d3ee", alpha=0.18, zorder=1)
+            axis.text(0, plan.entry_high, f"ENTRY {plan.entry_low:g}-{plan.entry_high:g} ({plan.zone.kind})",
+                      color="#22d3ee", **inside)
+        if plan.stop:
+            axis.axhline(plan.stop, color="#f43f5e", linestyle="--", linewidth=1.2)
+            axis.text(0, plan.stop, f"SL {plan.stop:g}", color="#f43f5e", **inside)
+        if plan.target_one:
+            axis.axhline(plan.target_one, color="#84cc16", linestyle="--", linewidth=1.2)
+            axis.text(0, plan.target_one + view.atr * 0.25, f"TP1 {plan.target_one:g}", color="#84cc16", **inside)
+        if plan.risk_reward:
+            axis.text(0.01, 0.03, f"decision: {plan.decision.replace('_', ' ')} | RR 1:{plan.risk_reward:.2f} | {plan.confidence} confidence",
+                      transform=axis.transAxes, color="#e2e8f0", fontsize=8)
+        else:
+            axis.text(0.01, 0.03, f"decision: {plan.decision.replace('_', ' ')} (no measurable target beyond the entry)",
+                      transform=axis.transAxes, color="#e2e8f0", fontsize=8)
+    shown = f"{report.price}" + (f" (live {report.live_price})" if report.live_price else "")
+    axis.set_title(f"{asset.name_en} 4H — {shown} | closed candles only", color="white", fontsize=11)
+    axis.set_xticks(list(range(0, len(window), max(len(window) // 8, 1))))
+    axis.set_xticklabels([window[index].timestamp.strftime("%m-%d %H:%M") for index in range(0, len(window), max(len(window) // 8, 1))], color="white", fontsize=7)
+    axis.tick_params(colors="white", labelsize=8)
+    axis.grid(True, alpha=0.15)
+    buffer = io.BytesIO()
+    figure.savefig(buffer, format="png", bbox_inches="tight", facecolor=figure.get_facecolor())
+    plt.close(figure)
+    buffer.seek(0)
+    return buffer
+
+
 TELEGRAM_TEXT_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
 # Telegram allows roughly 30 messages per second bot-wide; stay clearly under it.
@@ -885,6 +1249,21 @@ def text_cmd(message: types.Message):
     if request.intent == "rank":
         bot.reply_to(message, rank_assets(lang))
         return
+    if request.intent == "smc":
+        # Natural language ("smart money on gold", "مناطق السيولة في البيتكوين") reaches
+        # the same deterministic engine as /smc, keeping the chat's stored language
+        # preference when the message itself has no clear language marker.
+        prefs = smc_prefs.setdefault(message.chat.id, {})
+        smc_lang = lang if lang in SMC_LANGS else prefs.get("lang", "ar")
+        prefs["lang"] = smc_lang
+        if asset is None:
+            bot.reply_to(message,
+                         "اذكر الأصل مع الطلب، مثل: smc الذهب أو ما مناطق السيولة في BTC؟" if lang == "ar" else
+                         "Name the asset with the request, for example: smc gold or what is the BTC liquidity?",
+                         reply_markup=smc_keyboard("BTC", smc_lang, prefs.get("mode", "full")))
+            return
+        smc_respond(message, asset, smc_lang, prefs.get("mode", "full"))
+        return
     if request.intent == "risk":
         natural_risk_response(message, lang, text)
         return
@@ -905,6 +1284,7 @@ def text_cmd(message: types.Message):
                 facts = {
                     "asset": advice.asset.key,
                     "price": advice.current_price,
+                    "deterministic_indicators_only": True,
                     "action": advice.action,
                     "confidence": advice.confidence,
                     "reason": advice.reason,
@@ -1044,6 +1424,32 @@ def healthz():
     return jsonify({"ok": True, "service": "marketobserver", "stats": db.stats()})
 
 
+@app.get("/smc/<asset_key>")
+def smc_endpoint(asset_key: str):
+    """One multi-timeframe analysis as JSON from the same deterministic engine the
+    bot uses, so a dashboard or script can consume it without Telegram.
+
+    Query params: lang (ar|en|both), mode=brief for the short summary only,
+    refresh=1 to bypass the short cache.
+    """
+    asset = resolve_asset(asset_key)
+    if asset is None:
+        return jsonify({"error": "unknown asset"}), 404
+    lang = request.args.get("lang", "en")
+    if lang not in SMC_LANGS:
+        return jsonify({"error": "lang must be ar, en or both"}), 400
+    try:
+        report, _ = smc_build_report(asset, force=request.args.get("refresh") == "1")
+    except DataUnavailable:
+        return jsonify({"error": "no reliable market data for this asset", "asset": asset.key}), 503
+    payload = smc_to_dict(report)
+    if request.args.get("mode") == "brief":
+        payload["summary"] = render_smc_brief(report, lang)
+    else:
+        payload["report"] = render_smc(report, lang)
+    return jsonify(payload)
+
+
 def authorized() -> bool:
     return request.headers.get("X-Admin-Key", "") == settings.admin_api_key
 
@@ -1140,6 +1546,24 @@ def main():
         bot.remove_webhook()
     except Exception:
         logger.warning("could not remove old webhook", exc_info=True)
+    try:
+        bot.set_my_commands([
+            types.BotCommand("start", "البداية والأزرار / start and buttons"),
+            types.BotCommand("smc", "تحليل سيولة ذكية 4H/1H/15m / smart-money report"),
+            types.BotCommand("analyze", "تحليل المؤشرات / indicator analysis"),
+            types.BotCommand("chart", "شارت من بيانات حقيقية / real-data chart"),
+            types.BotCommand("risk", "حساب المخاطرة / position sizing"),
+            types.BotCommand("alert", "تنبيه سعري / price alert"),
+            types.BotCommand("alerts", "قائمة التنبيهات / list alerts"),
+            types.BotCommand("cancel_alert", "إلغاء تنبيه / cancel alert"),
+            types.BotCommand("signals", "إشارات السوق / market signals"),
+            types.BotCommand("newsalerts", "تنبيهات الأخبار / news alerts"),
+            types.BotCommand("timezone", "المنطقة الزمنية / timezone"),
+            types.BotCommand("paperbuy", "شراء ورقي / paper buy"),
+            types.BotCommand("papersell", "بيع ورقي / paper sell"),
+        ])
+    except Exception:
+        logger.warning("could not register the Telegram command menu", exc_info=True)
     logger.info("MarketObserver Pro started in %s mode", "paper" if settings.paper_trading else "live-disabled")
     while True:
         try:

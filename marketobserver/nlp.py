@@ -46,6 +46,8 @@ def _intent(text: str) -> str:
         return "general"
     if re.search(r"(افضل اصل|افضل عمله|افضل سهم|ماذا اشتري|وش اشتري|what should i buy|best asset|best coin|best stock|rank|ترتيب)", lowered):
         return "rank"
+    if re.search(r"(\bsmc\b|smart money|smart\-money|price action|liquidity zone|liquidity zones|liquidity pool|liquidity sweep|order block|fair value gap|\bfvg\b|\bbos\b|\bchoch\b|change of character|break of structure|سيوله ذكيه|المال الذكي|اموال ذكيه|مناطق السيوله|منطقة سيوله|منطقة السيوله|صيد السيوله|اوردر بلوك|بلوك الاوامر|فجوه سعريه|فجوات سعريه|كسر الهيكل|كسر البنيه|تغير الشخصيه|تغير الطباع|انفجار سعري|تحليل متعدد الاطر|متعدد الاطر|اطار زمني اعلى|هيكل سعري)", lowered):
+        return "smc"
     if re.search(r"(خبر|اخبار|news|headline|sentiment|مشاعر السوق|معنويات)", lowered):
         return "news"
     if re.search(r"(نبه|تنبيه|اشعار|راقب|alert|notify|watch)", lowered):
@@ -70,11 +72,20 @@ def _refers_to_last_asset(text: str) -> bool:
 
 def _known_education_topic(text: str) -> bool:
     lowered = normalize_text(text)
-    return bool(re.search(r"(rsi|مؤشر القوه النسبيه|وقف الخساره|وقف الخساره|دعم|مقاومه|تضخم|فائده|فائدة|تداول|استثمار|رافعة|رافعه|هامش|leverage|margin|stop loss|support|resistance|inflation|interest rate|trading|investing)", lowered))
+    return bool(re.search(r"(rsi|سيوله|السيوله|سيولة|اوردر بلوك|بلوك الاوامر|order block|فجوه سعريه|fair value gap|fvg|bos|choch|كسر الهيكل|تغير الشخصيه|هيكل سعري|مناطق السيوله|مؤشر القوه النسبيه|وقف الخساره|وقف الخساره|دعم|مقاومه|تضخم|فائده|فائدة|تداول|استثمار|رافعة|رافعه|هامش|leverage|margin|stop loss|support|resistance|inflation|interest rate|trading|investing)", lowered))
+
+
+def _is_definition_question(text: str) -> bool:
+    lowered = normalize_text(text)
+    return bool(re.search(r"(ما هو|ما هي|ماهيه|ماهي|اش يعني|يعني ايش|عرف لي|تعريف|what is|what are|how does|explain|definition)", lowered))
 
 
 def parse_request(text: str, last_asset_key: str | None = None) -> UserRequest:
     intent = _intent(text)
+    if intent == "smc" and resolve_asset(text) is None and _is_definition_question(text):
+        # "what is liquidity?" asks for a definition, not for a live report on an
+        # asset; keep those in the education path so neither answer is wrong.
+        intent = "education"
     asset = resolve_asset(text)
     if intent == "education" and asset is None and not _known_education_topic(text):
         intent = "unknown"
