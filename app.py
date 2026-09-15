@@ -865,17 +865,21 @@ def deliver_smc(chat_id: int, text: str, markup=None, edit_message_id: int | Non
 
 
 def smc_respond(target_message, asset: Asset, lang: str, mode: str, force: bool = False, edit_message_id: int | None = None):
+    # The keyboard is built before the provider call on purpose: an error reply
+    # that carries no buttons would strand the user (no retry, no asset switch),
+    # which is exactly what happens when a data source is geo-blocked.
+    markup = smc_keyboard(asset.key, lang, mode)
     try:
         report, _ = smc_build_report(asset, force=force)
     except DataUnavailable:
-        deliver_smc(target_message.chat.id, "⛔ " + (AR["data_error"] if lang == "ar" else "Reliable market data is unavailable for this asset right now. No synthetic candles were used, so no analysis is produced."), edit_message_id=edit_message_id)
+        deliver_smc(target_message.chat.id, "⛔ " + (AR["data_error"] if lang == "ar" else "Reliable market data is unavailable for this asset right now. No synthetic candles were used, so no analysis is produced."), markup, edit_message_id=edit_message_id)
         return None
     except Exception:
         logger.exception("smc analysis failed for %s", asset.key)
-        deliver_smc(target_message.chat.id, "⛔ " + ("تعذر إكمال التحليل مؤقتًا." if lang == "ar" else "Analysis could not be completed right now."), edit_message_id=edit_message_id)
+        deliver_smc(target_message.chat.id, "⛔ " + ("تعذر إكمال التحليل مؤقتًا. جرّب إعادة الحساب من الزر." if lang == "ar" else "Analysis could not be completed right now. Use Recompute below to retry."), markup, edit_message_id=edit_message_id)
         return None
     text = render_smc_brief(report, lang) if mode == "brief" else render_smc(report, lang)
-    deliver_smc(target_message.chat.id, text, smc_keyboard(asset.key, lang, mode), edit_message_id)
+    deliver_smc(target_message.chat.id, text, markup, edit_message_id)
     return report
 
 
@@ -918,7 +922,8 @@ def smc_cmd(message: types.Message):
             bot.send_photo(message.chat.id, smc_chart(asset, report, candles), caption=render_smc_brief(report, lang),
                            reply_markup=smc_keyboard(asset.key, lang, "full"))
         except DataUnavailable:
-            bot.reply_to(message, AR["data_error"] if lang == "ar" else "Reliable market data is unavailable; no chart was invented.")
+            bot.reply_to(message, AR["data_error"] if lang == "ar" else "Reliable market data is unavailable; no chart was invented.",
+                         reply_markup=smc_keyboard(asset.key, lang, "full"))
         return
     prefs["mode"] = mode
     if lang_override:

@@ -25,6 +25,9 @@ PHOTOS: list = []
 @pytest.fixture(autouse=True)
 def transport(monkeypatch):
     CALLBACKS.clear(); SENT.clear(); EDITS.clear(); PHOTOS.clear()
+    # smc_prefs/smc_reports are process state; without this the chat's stored
+    # language leaks out of one test into the next and button labels flip.
+    app.smc_prefs.clear(); app.smc_reports.clear()
 
     def reply_to(message, text, **kwargs):
         SENT.append(("reply", text, kwargs))
@@ -187,3 +190,55 @@ def test_natural_language_reaches_the_same_report():
 def test_unknown_asset_button_payload_is_answered_not_swallowed():
     app.bot.process_new_updates([callback_update("smc:asset:NOPE:en:full")])
     assert CALLBACKS, "the button must always be answered so Telegram clears the spinner"
+
+
+def test_provider_failure_still_leaves_the_buttons_attached(monkeypatch):
+    """Regression: a data outage must not strand the user with a bare error.
+
+    The keyboard is what lets them retry or switch asset, and this is the exact
+    path a geo-blocked provider triggers in production.
+    """
+    from marketobserver.market_data import DataUnavailable
+
+    def failing(asset, force=False):
+        raise DataUnavailable("SMC needs 4H and 1H candles for BTC")
+
+    monkeypatch.setattr(app, "smc_build_report", failing)
+    app.bot.process_new_updates([message_update("/smc BTC", language="ar")])
+    assert "⛔" in sent_text()
+    assert any(kwargs.get("reply_markup") is not None for _, _, kwargs in SENT), \
+        "error replies must keep the inline buttons"
+    keyboard = next(kwargs["reply_markup"] for _, _, kwargs in SENT if kwargs.get("reply_markup"))
+    labels = [button.text for row in keyboard.keyboard for button in row]
+    assert any("إعادة حساب" in label for label in labels)
+
+
+def test_chart_outage_reply_keeps_its_buttons_too(monkeypatch):
+    from marketobserver.market_data import DataUnavailable
+
+    monkeypatch.setattr(app, "smc_build_report",
+                        lambda asset, force=False: (_ for _ in ()).throw(DataUnavailable("no candles")))
+    app.bot.process_new_updates([message_update("/smc BTC chart", language="en")])
+    assert any(kwargs.get("reply_markup") is not None for _, _, kwargs in SENT)
+
+
+def test_start_message_carries_the_asset_buttons():
+    app.bot.process_new_updates([message_update("/start", language="ar")])
+    assert any(kwargs.get("reply_markup") is not None for _, _, kwargs in SENT), \
+        "/start must expose the smart-money buttons"
+
+
+def test_keyboard_respects_telegram_limits():
+    """Telegram rejects a whole message if any limit is broken — guard it here."""
+    for lang in ("ar", "en", "both"):
+        for asset_key in app.SMC_PRIMARY_ASSETS + app.SMC_MORE_ASSETS:
+            keyboard = app.smc_keyboard(asset_key, lang, "full")
+            rows = keyboard.keyboard
+            assert len(rows) <= 100
+            assert all(len(row) <= 10 for row in rows)
+            for row in rows:
+                for button in row:
+                    data = (button.callback_data or "").encode("utf-8")
+                    assert 1 <= len(data) <= 64, (lang, asset_key, button.callback_data)
+            labels = [button.text for row in rows for button in row]
+            assert len(labels) == len(set(labels)), "duplicate button labels confuse taps"
