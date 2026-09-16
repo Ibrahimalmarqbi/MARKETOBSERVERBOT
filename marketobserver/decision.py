@@ -978,7 +978,9 @@ def _render_en(decision: StrictDecision, verbose: bool) -> str:
         lines.append("")
         lines.append("Gate chain (evaluated in this order, the first failure stops the chain):")
         for step in decision.steps:
-            marker = "PASS" if step.passed else ("FAIL" if step.reached else "not reached")
+            # reachability comes first: a gate that happens to be satisfied on
+            # the raw data was still never reached once the chain had stopped
+            marker = "not reached" if not step.reached else ("PASS" if step.passed else "FAIL")
             lines.append(f"[{marker}] {step.number}. {step.title}: {step.detail}")
         if 0 < decision.stopped_at < 7:
             lines.append(f"chain stopped at step {decision.stopped_at}; gates "
@@ -1042,7 +1044,7 @@ def _render_ar(decision: StrictDecision, verbose: bool) -> str:
         lines.append("")
         lines.append("سلسلة البوابات (بهذا الترتيب، وأول فشل يوقف السلسلة):")
         for step in decision.steps:
-            marker = "نجحت" if step.passed else ("فشلت" if step.reached else "لم تُختبر")
+            marker = "لم تُختبر" if not step.reached else ("نجحت" if step.passed else "فشلت")
             lines.append(f"[{marker}] {step.number}. {step.title}: {step.detail}")
         if 0 < decision.stopped_at < 7:
             lines.append(f"توقفت السلسلة عند البوابة {decision.stopped_at}؛ البوابات "

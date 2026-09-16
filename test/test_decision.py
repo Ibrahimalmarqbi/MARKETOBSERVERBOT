@@ -266,6 +266,10 @@ def test_break_on_weak_volume_is_an_invalid_break():
     assert not next(step for step in decision.steps if step.number == 4).reached
     assert next(step for step in decision.steps if step.number == 4).state == "stopped"
     assert any("invalid break" in reason or "fake break" in reason for reason in decision.reasons)
+    verbose = render(decision, "en", verbose=True)
+    assert "[FAIL] 3." in verbose
+    assert "[not reached] 4." in verbose and "[not reached] 7." in verbose
+    assert "chain stopped at step 3; gates 4-7 were not reached" in verbose
 
 
 # --------------------------------------------------------------------------- #
