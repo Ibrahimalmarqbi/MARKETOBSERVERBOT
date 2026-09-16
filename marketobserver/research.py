@@ -74,6 +74,41 @@ def headline_fingerprint(item: NewsItem) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def headline_age_hours(item: NewsItem, now: datetime | None = None) -> float | None:
+    """Hours since publication, or None when the feed gives no usable date."""
+    if not item.published:
+        return None
+    try:
+        from email.utils import parsedate_to_datetime
+        moment = parsedate_to_datetime(item.published)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    moment_now = now or datetime.now(timezone.utc)
+    return max(0.0, (moment_now - moment).total_seconds() / 3600)
+
+
+def is_fresh(item: NewsItem, max_age_hours: float = 6.0, now: datetime | None = None) -> bool:
+    """Auto-alerts only fire on fresh headlines; idle users get the latest
+    important story when they return, never a stale backlog."""
+    age = headline_age_hours(item, now)
+    return True if age is None else age <= max_age_hours
+
+
+def pick_top(items: list[NewsItem], now: datetime | None = None) -> NewsItem | None:
+    """The single most alert-worthy headline: high impact first, then newest."""
+    rank = {"high": 0, "medium": 1, "low": 2}
+    scored = []
+    for item in items:
+        level = headline_importance_level(item)
+        age = headline_age_hours(item, now)
+        scored.append((rank.get(level, 2), age if age is not None else 1e9, item))
+    scored.sort(key=lambda row: (row[0], row[1]))
+    return scored[0][2] if scored else None
+
+
 def _sentiment(title: str) -> str:
     words = set(re.findall(r"[A-Za-z]+|[\u0600-\u06ff]+", title.lower()))
     score = len(words & _POSITIVE) - len(words & _NEGATIVE)

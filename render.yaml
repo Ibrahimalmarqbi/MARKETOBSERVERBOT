@@ -23,6 +23,8 @@ services:
         value: "900"
       - key: NEWS_SCAN_SECONDS
         value: "900"
+      - key: CALENDAR_SCAN_SECONDS
+        value: "60"
       - key: PAPER_TRADING
         value: "true"
       - key: MAX_RISK_PERCENT
