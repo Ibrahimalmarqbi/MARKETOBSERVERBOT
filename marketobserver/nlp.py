@@ -48,6 +48,10 @@ def _intent(text: str) -> str:
         return "rank"
     if re.search(r"(\bsmc\b|smart money|smart\-money|price action|liquidity zone|liquidity zones|liquidity pool|liquidity sweep|order block|fair value gap|\bfvg\b|\bbos\b|\bchoch\b|change of character|break of structure|سيوله ذكيه|المال الذكي|اموال ذكيه|مناطق السيوله|منطقة سيوله|منطقة السيوله|صيد السيوله|اوردر بلوك|بلوك الاوامر|فجوه سعريه|فجوات سعريه|كسر الهيكل|كسر البنيه|تغير الشخصيه|تغير الطباع|انفجار سعري|تحليل متعدد الاطر|متعدد الاطر|اطار زمني اعلى|هيكل سعري)", lowered):
         return "smc"
+    if re.search(r"(قرار نهائي|القرار النهائي|قرار شراء|قرار بيع|شراء ام بيع|بيع ام شراء|اشتري او ابيع|ابيع او اشتري|انتظر ام ادخل|ادخل ولا انتظر|buy or sell|sell or buy|buy or wait|long or short|\bverdict\b|final decision|strict decision)", lowered):
+        # An explicit request for the strict verdict (BUY / SELL / WAIT) routes to
+        # the gate chain instead of the looser advisory text.
+        return "decision"
     if re.search(r"(خبر|اخبار|news|headline|sentiment|مشاعر السوق|معنويات)", lowered):
         return "news"
     if re.search(r"(نبه|تنبيه|اشعار|راقب|alert|notify|watch)", lowered):
