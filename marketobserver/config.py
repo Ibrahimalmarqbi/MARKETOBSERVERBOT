@@ -20,6 +20,7 @@ class Settings:
     admin_api_key: str
     admin_chat_ids: tuple[int, ...]
     default_interval: str
+    live_price_ttl_seconds: int
     alert_poll_seconds: int
     signal_scan_seconds: int
     news_scan_seconds: int
@@ -53,6 +54,7 @@ class Settings:
             admin_api_key=admin_key,
             admin_chat_ids=parse_admin_chat_ids(os.getenv("ADMIN_CHAT_IDS", "")),
             default_interval=os.getenv("DEFAULT_INTERVAL", "1h"),
+            live_price_ttl_seconds=max(1, int(os.getenv("LIVE_PRICE_TTL_SECONDS", "3"))),
             alert_poll_seconds=max(15, int(os.getenv("ALERT_POLL_SECONDS", "60"))),
             signal_scan_seconds=max(300, int(os.getenv("SIGNAL_SCAN_SECONDS", "900"))),
             news_scan_seconds=max(300, int(os.getenv("NEWS_SCAN_SECONDS", "900"))),

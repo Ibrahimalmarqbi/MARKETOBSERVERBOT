@@ -29,6 +29,8 @@ def detect_language(text: str) -> str:
 
 def _timeframe(text: str) -> str | None:
     lowered = normalize_text(text)
+    if re.search(r"(5m|5min|5 دقايق|5 دقيقه|خمس دقايق|خمس دقائق)", lowered):
+        return "5m"
     if re.search(r"\b(15m|15min|ربع ساعه|15 دقيقه)\b", lowered):
         return "15m"
     if re.search(r"\b(1h|hour|ساعة|ساعه|ساعي)\b", lowered):
@@ -52,8 +54,12 @@ def _intent(text: str) -> str:
         # An explicit request for the strict verdict (BUY / SELL / WAIT) routes to
         # the gate chain instead of the looser advisory text.
         return "decision"
+    if re.search(r"(خيارات ثنائيه|تداول ثنائي|الخيارات الثنائيه|binary|باينري|ثنائي|كول او بوت|صعود او هبوط)", lowered):
+        return "binary"
     if re.search(r"(خبر|اخبار|news|headline|sentiment|مشاعر السوق|معنويات)", lowered):
         return "news"
+    if re.search(r"(سعر|اسعار|بكم|كم قيمه|كم سعر|السعر الحالي|price|quote|كم وصل)", lowered):
+        return "price"
     if re.search(r"(نبه|تنبيه|اشعار|راقب|alert|notify|watch)", lowered):
         return "alert"
     if re.search(r"(مخاطر|مخاطره|risk|حجم الصفقه|حجم|position size|وقف الخساره|راس المال|رأس المال)", lowered):
@@ -95,7 +101,9 @@ def parse_request(text: str, last_asset_key: str | None = None) -> UserRequest:
         intent = "unknown"
     if intent == "unknown" and asset is not None:
         intent = "analysis"
-    if asset is None and last_asset_key and intent in {"advice", "chart"}:
+    if asset is None and last_asset_key and intent in {"advice", "chart", "binary"}:
+        asset = resolve_asset(last_asset_key)
+    elif asset is None and last_asset_key and intent == "price":
         asset = resolve_asset(last_asset_key)
     elif asset is None and last_asset_key and intent == "news" and _refers_to_last_asset(text):
         asset = resolve_asset(last_asset_key)

@@ -20,14 +20,16 @@ import telebot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 
-from marketobserver.assets import ASSETS, Asset, resolve_asset
+from marketobserver.assets import ASSET_CLASS_NAMES, ASSET_CLASS_ORDER, ASSETS, BINARY_POPULAR, Asset, assets_by_class, resolve_asset
 from marketobserver.analysis import Analysis, analyze
 from marketobserver.advisor import Advice, build_advice
 from marketobserver.nlp import parse_request
 from marketobserver.broker import LiveBrokerNotConfigured, OrderRequest, PaperBroker
 from marketobserver.config import Settings
 from marketobserver.db import Database
+from marketobserver.live import LivePriceProvider, Quote, QuoteUnavailable
 from marketobserver.market_data import DataUnavailable, MarketDataProvider
+from marketobserver.binary import decide as build_binary_verdict, render as render_binary, to_dict as binary_to_dict
 from marketobserver.research import MarketResearch, ResearchSnapshot, headline_fingerprint, headline_importance_level
 from marketobserver.risk import calculate_position_size
 from marketobserver.llm import GroundedLLM
@@ -50,6 +52,7 @@ migrated_news_users = db.migrate_news_subscriptions()
 if migrated_news_users:
     logger.info("automatically enrolled %s active users in news alerts", migrated_news_users)
 market = MarketDataProvider()
+live = LivePriceProvider(settings.live_price_ttl_seconds)
 research = MarketResearch()
 llm = GroundedLLM(settings.llm_api_key, settings.llm_api_base, settings.llm_model)
 paper_broker = PaperBroker()
@@ -61,20 +64,20 @@ app = Flask(__name__)
 
 
 AR = {
-    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، هل أدخل البيتكوين؟ أو احسب مخاطرة رأس المال 10000 بنسبة 1% دخول 4715 وقف 4690. يمكنك أيضًا استخدام /analyze و /smc (تحليل سيولة ذكية بأزرار) و /decision (قرار صارم: شراء/بيع/انتظار) و /alert و /risk و /paperbuy.",
+    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، سعر البيتكوين، ثنائي EURUSD، أو احسب مخاطرة رأس المال 10000 بنسبة 1% دخول 4715 وقف 4690. الأوامر: /price (سعر لحظي) و /assets (كل الأصول) و /binary (تداول ثنائي CALL/PUT) و /analyze و /smc و /decision و /alert و /risk و /paperbuy.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
-    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
 
 EN = {
-    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
 
 
 def unknown_asset_text(lang: str) -> str:
-    examples = "BTC, ETH, SOL, XAUUSD, XAGUSD, EURUSD, WTI, BRENT, GASOLINE, NATGAS, AAPL, TSLA, NVDA"
-    return ("لم أتعرف على الأصل. اكتب اسمًا أو رمزًا واضحًا، مثل: الذهب، الفضة، برنت، البنزين، BTC، EURUSD، أو AAPL."
-            if lang == "ar" else f"I could not identify the asset. Use a clear name or ticker, for example: {examples}.")
+    examples = "BTC, ETH, SOL, BNB, XRP, DOGE, XAUUSD, EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, WTI, AAPL, TSLA"
+    return ("لم أتعرف على الأصل. اكتب اسمًا أو رمزًا واضحًا، مثل: الذهب، البيتكوين، EURUSD، الباوند ين، أو DOGE — أو اعرض كل الأصول بـ /assets."
+            if lang == "ar" else f"I could not identify the asset. Use a clear name or ticker, for example: {examples}. See /assets for the full catalog.")
 
 
 def out_of_scope_response(lang: str) -> str:
@@ -325,6 +328,31 @@ def analysis_text(asset: Asset, result: Analysis, lang: str, tz_name: str = "Asi
         f"Data source: {source}\n"
         "This is automated indicator analysis, not a guarantee or personalized advice."
     )
+
+
+def quote_text(asset: Asset, quote: Quote, lang: str) -> str:
+    name = asset.name_ar if lang == "ar" else asset.name_en
+    if lang == "ar":
+        return (f"💰 {name} ({asset.key}): {quote.price} {asset.quote}\n"
+                f"📡 المصدر: {quote.source} | عمر السعر: {quote.age_seconds:.1f} ثانية")
+    return (f"💰 {name} ({asset.key}): {quote.price} {asset.quote}\n"
+            f"📡 Source: {quote.source} | quote age: {quote.age_seconds:.1f}s")
+
+
+def assets_text(lang: str, asset_class: str | None = None) -> str:
+    classes = [asset_class] if asset_class in ASSET_CLASS_ORDER else list(ASSET_CLASS_ORDER)
+    total = sum(len(assets_by_class(cls)) for cls in classes)
+    lines = [f"📚 كتالوج الأصول ({total})" if lang == "ar" else f"📚 Asset catalog ({total})"]
+    for cls in classes:
+        names = ASSET_CLASS_NAMES[cls]
+        lines.append("")
+        lines.append(f"━━ {names[0] if lang == 'ar' else names[1]} ━━")
+        for asset in assets_by_class(cls):
+            label = asset.name_ar if lang == "ar" else asset.name_en
+            lines.append(f"• {asset.key} — {label}")
+    lines.append("")
+    lines.append("مثال: /price EURUSD أو /binary BTC أو /smc الذهب" if lang == "ar" else "Examples: /price EURUSD, /binary BTC, /smc gold")
+    return "\n".join(lines)
 
 
 def translate_advice_reason(reason: str, lang: str) -> str:
@@ -612,6 +640,45 @@ def timezone_cmd(message: types.Message):
     bot.reply_to(message, f"تم ضبط التوقيت على {tz_name}." if lang == "ar" else f"Timezone set to {tz_name}.")
 
 
+@bot.message_handler(commands=["price"])
+def price_cmd(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    asset = selected_asset(message, parts[1] if len(parts) == 2 else None)
+    remember_user(message, asset)
+    lang = user_language(message)
+    if not asset:
+        bot.reply_to(message, unknown_asset_text(lang))
+        return
+    try:
+        quote = live.get_quote(asset)
+        bot.reply_to(message, quote_text(asset, quote, lang))
+    except QuoteUnavailable:
+        bot.reply_to(message, AR["data_error"] if lang == "ar" else "No live quote is available for this asset right now.")
+    except Exception:
+        logger.exception("price failed for %s", asset.key)
+        bot.reply_to(message, "تعذر جلب السعر مؤقتًا." if lang == "ar" else "Price lookup failed temporarily.")
+
+
+@bot.message_handler(commands=["assets"])
+def assets_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    parts = message.text.split(maxsplit=1)
+    wanted = (parts[1].strip().lower() if len(parts) == 2 else "")
+    aliases = {"crypto": "crypto", "كريبتو": "crypto", "رقمية": "crypto",
+               "forex": "forex", "فوركس": "forex", "عملات": "forex",
+               "metals": "metals", "معادن": "metals", "ذهب": "metals",
+               "commodity": "commodity", "commodities": "commodity", "سلع": "commodity", "نفط": "commodity",
+               "index": "index", "indices": "index", "مؤشرات": "index",
+               "stock": "stock", "stocks": "stock", "أسهم": "stock", "اسهم": "stock"}
+    asset_class = aliases.get(wanted)
+    if wanted and not asset_class:
+        bot.reply_to(message, "استخدم: /assets [crypto|forex|metals|commodity|index|stock]" if lang == "ar" else "Usage: /assets [crypto|forex|metals|commodity|index|stock]")
+        return
+    for chunk in split_broadcast_text(assets_text(lang, asset_class)):
+        bot.send_message(message.chat.id, chunk)
+
+
 @bot.message_handler(commands=["analyze"])
 def analyze_cmd(message: types.Message):
     parts = message.text.split(maxsplit=1)
@@ -749,8 +816,9 @@ def paper_order_cmd(message: types.Message):
 # the report text is assembled from its structured output.
 
 SMC_TIMEFRAMES = ("4h", "1h", "15m")
-SMC_PRIMARY_ASSETS = ("BTC", "ETH", "SOL", "XAUUSD", "EURUSD", "WTI")
-SMC_MORE_ASSETS = ("PAXG", "XAGUSD", "BRENT", "NATGAS", "DXY", "AAPL", "TSLA", "NVDA", "QQQ")
+SMC_PRIMARY_ASSETS = ("BTC", "ETH", "XAUUSD", "EURUSD", "GBPUSD", "USDJPY")
+SMC_MORE_ASSETS = ("SOL", "PAXG", "XAGUSD", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "GBPJPY",
+                   "WTI", "BRENT", "NATGAS", "DXY", "AAPL", "TSLA", "NVDA", "QQQ")
 SMC_MODES = ("brief", "full")
 # Per-chat UI preference. The process is single-worker by design (Telegram
 # polling and the alert loop run in this process), so an in-memory dict is the
@@ -804,7 +872,9 @@ def smc_keyboard(asset_key: str, lang: str, mode: str) -> types.InlineKeyboardMa
     mode = mode if mode in SMC_MODES else "full"
     keyboard = types.InlineKeyboardMarkup(row_width=3)
     names = {"BTC": "₿ BTC", "ETH": "Ξ ETH", "SOL": "◎ SOL", "XAUUSD": "🥇 XAU", "EURUSD": "💶 EUR", "WTI": "🛢 WTI",
-             "PAXG": "🥈 PAXG", "XAGUSD": "⚪️ XAG", "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS", "DXY": "💵 DXY",
+             "PAXG": "🥈 PAXG", "XAGUSD": "⚪️ XAG", "GBPUSD": "💷 GBP", "USDJPY": "💴 JPY", "AUDUSD": "🦘 AUD",
+             "USDCAD": "🍁 CAD", "USDCHF": "🇨🇭 CHF", "NZDUSD": "🥝 NZD", "EURJPY": "🇪🇺JPY", "GBPJPY": "🇬🇧JPY",
+             "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS", "DXY": "💵 DXY",
              "AAPL": "🍎 AAPL", "TSLA": "🚗 TSLA", "NVDA": "🎮 NVDA", "QQQ": "📈 QQQ"}
     for row in (SMC_PRIMARY_ASSETS[:3], SMC_PRIMARY_ASSETS[3:]):
         keyboard.add(*[types.InlineKeyboardButton(("✅ " if key == asset_key else "") + names.get(key, key),
@@ -938,7 +1008,9 @@ def smc_cmd(message: types.Message):
 
 
 SMC_BUTTON_NAMES = {"BTC": "₿ BTC", "ETH": "Ξ ETH", "SOL": "◎ SOL", "PAXG": "🥈 PAXG", "XAUUSD": "🥇 XAU",
-                    "XAGUSD": "⚪️ XAG", "EURUSD": "💶 EUR", "WTI": "🛢 WTI", "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS",
+                    "XAGUSD": "⚪️ XAG", "EURUSD": "💶 EUR", "GBPUSD": "💷 GBP", "USDJPY": "💴 JPY", "AUDUSD": "🦘 AUD",
+                    "USDCAD": "🍁 CAD", "USDCHF": "🇨🇭 CHF", "NZDUSD": "🥝 NZD", "EURJPY": "🇪🇺JPY", "GBPJPY": "🇬🇧JPY",
+                    "WTI": "🛢 WTI", "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS",
                     "DXY": "💵 DXY", "AAPL": "🍎 AAPL", "TSLA": "🚗 TSLA", "NVDA": "🎮 NVDA", "QQQ": "📈 QQQ"}
 
 
@@ -1177,6 +1249,113 @@ def decision_callback(call: types.CallbackQuery):
         return
     decision_respond(call.message, asset, lang, verbose in {"1", "true"}, force=force == "1",
                      edit_message_id=call.message.message_id if call.message else None)
+    bot.answer_callback_query(call.id)
+
+
+# --------------------------------------------------------------------------- #
+# Binary engine (/binary): CALL / PUT / WAIT on 15m context + 5m execution.
+# Built for short-expiry binary-style trading; the strict gate chain lives in
+# marketobserver/binary.py and this layer only fetches candles, attaches the
+# live reference price and renders the verdict.
+# --------------------------------------------------------------------------- #
+BINARY_TIMEFRAMES = ("5m", "15m")
+BINARY_TTL_SECONDS = 30
+binary_cache: dict[str, tuple[float, object]] = {}
+
+
+def binary_verdict_for(asset: Asset, force: bool = False):
+    cached = binary_cache.get(asset.key)
+    if cached and not force and time.time() - cached[0] < BINARY_TTL_SECONDS:
+        return cached[1]
+    candles: dict[str, list] = {}
+    for timeframe in BINARY_TIMEFRAMES:
+        try:
+            candles[timeframe] = market.get_candles(asset, timeframe, 120)
+        except DataUnavailable:
+            continue
+    if "5m" not in candles or "15m" not in candles:
+        raise DataUnavailable(f"binary needs 5m and 15m candles for {asset.key}")
+    try:
+        live_price = live.get_quote(asset).price
+    except QuoteUnavailable:
+        live_price = None
+    verdict = build_binary_verdict(asset.key, asset.name_ar, asset.name_en, asset.quote,
+                                   asset.price_decimals, candles["5m"], candles["15m"],
+                                   market.last_source(asset.key) or "unknown", live_price)
+    binary_cache[asset.key] = (time.time(), verdict)
+    return verdict
+
+
+def binary_keyboard(asset_key: str, lang: str) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    for index in range(0, len(BINARY_POPULAR), 3):
+        row = BINARY_POPULAR[index:index + 3]
+        keyboard.add(*[types.InlineKeyboardButton(
+            ("✅ " if key == asset_key else "") + SMC_BUTTON_NAMES.get(key, key),
+            callback_data=f"bin:run:{key}:{lang}:0") for key in row])
+    keyboard.add(
+        types.InlineKeyboardButton("🔄 تحديث" if lang == "ar" else "🔄 Refresh",
+                                   callback_data=f"bin:run:{asset_key}:{lang}:1"),
+        types.InlineKeyboardButton("🇸🇦 عربي" if lang == "ar" else "🇸🇦 AR",
+                                   callback_data=f"bin:run:{asset_key}:ar:0"),
+        types.InlineKeyboardButton("🇬🇧 EN", callback_data=f"bin:run:{asset_key}:en:0"),
+    )
+    return keyboard
+
+
+def binary_respond(target_message, asset: Asset, lang: str, force: bool = False,
+                   edit_message_id: int | None = None) -> None:
+    markup = binary_keyboard(asset.key, lang)
+    try:
+        verdict = binary_verdict_for(asset, force=force)
+    except DataUnavailable:
+        text = "⛔ " + (AR["data_error"] if lang == "ar" else
+                        "Reliable 5m/15m market data is unavailable for this asset right now, so no binary verdict is produced.")
+        deliver_smc(target_message.chat.id, text, markup, edit_message_id=edit_message_id)
+        return
+    except Exception:
+        logger.exception("binary verdict failed for %s", asset.key)
+        deliver_smc(target_message.chat.id,
+                      "⛔ " + ("تعذر إكمال القرار الثنائي الآن. جرّب التحديث." if lang == "ar" else
+                              "The binary verdict could not be completed. Try Refresh."),
+                      markup, edit_message_id=edit_message_id)
+        return
+    deliver_smc(target_message.chat.id, render_binary(verdict, lang), markup, edit_message_id)
+
+
+@bot.message_handler(commands=["binary", "bin"])
+def binary_cmd(message: types.Message):
+    parts = (message.text or "").split(maxsplit=1)
+    lang = user_language(message)
+    asset = selected_asset(message, parts[1] if len(parts) == 2 else None)
+    remember_user(message, asset)
+    if asset is None:
+        bot.reply_to(message,
+                     "اذكر الأصل مثل: /binary EURUSD أو /binary الذهب." if lang == "ar" else
+                     "Name an asset, for example /binary EURUSD or /binary gold.",
+                     reply_markup=binary_keyboard("EURUSD", lang))
+        return
+    prefs = smc_prefs.setdefault(message.chat.id, {})
+    prefs["lang"] = lang
+    binary_respond(message, asset, lang, force=True)
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("bin:")))
+def binary_callback(call: types.CallbackQuery):
+    parts = (call.data or "").split(":")
+    if len(parts) < 5:
+        bot.answer_callback_query(call.id)
+        return
+    _, _, asset_key, lang, force = parts[:5]
+    lang = lang if lang in ("ar", "en") else "ar"
+    asset = ASSETS.get(asset_key) or resolve_asset(asset_key)
+    if asset is None:
+        bot.answer_callback_query(call.id, "أصل غير معروف" if lang == "ar" else "Unknown asset", show_alert=True)
+        return
+    smc_prefs.setdefault(call.message.chat.id, {})["lang"] = lang
+    db.set_last_asset(call.message.chat.id, asset.key)
+    binary_respond(call.message, asset, lang, force=force == "1",
+                   edit_message_id=call.message.message_id if call.message else None)
     bot.answer_callback_query(call.id)
 
 
@@ -1439,6 +1618,34 @@ def text_cmd(message: types.Message):
             return
         decision_respond(message, asset, decision_lang)
         return
+    if request.intent == "price":
+        # "سعر الذهب؟", "BTC price" -> instant live quote, never a stale close.
+        if asset is None:
+            bot.reply_to(message,
+                         "اذكر الأصل مع السعر، مثل: سعر الذهب أو BTC price." if lang == "ar" else
+                         "Name the asset with the price request, for example: gold price or BTC price.")
+            return
+        try:
+            bot.reply_to(message, quote_text(asset, live.get_quote(asset), lang))
+        except QuoteUnavailable:
+            bot.reply_to(message, AR["data_error"] if lang == "ar" else "No live quote is available for this asset right now.")
+        except Exception:
+            logger.exception("live price failed")
+            bot.reply_to(message, "تعذر جلب السعر حاليًا." if lang == "ar" else "Price lookup failed right now.")
+        return
+    if request.intent == "binary":
+        # "ثنائي EURUSD", "binary gold" -> the short-expiry CALL/PUT engine.
+        prefs = smc_prefs.setdefault(message.chat.id, {})
+        binary_lang = lang if lang in ("ar", "en") else prefs.get("lang", "ar")
+        prefs["lang"] = binary_lang
+        if asset is None:
+            bot.reply_to(message,
+                         "اذكر الأصل مع طلب الثنائي، مثل: ثنائي EURUSD أو binary BTC." if lang == "ar" else
+                         "Name the asset with the request, for example: binary EURUSD or ثنائي الذهب.",
+                         reply_markup=binary_keyboard("EURUSD", binary_lang))
+            return
+        binary_respond(message, asset, binary_lang)
+        return
     if request.intent == "risk":
         natural_risk_response(message, lang, text)
         return
@@ -1505,6 +1712,14 @@ def alert_loop():
                 asset = ASSETS.get(asset_key)
                 if not asset:
                     continue
+                # Alerts trigger on the live quote (seconds old), not on the
+                # last closed candle; the candle close is only a fallback so a
+                # brief quote outage never freezes every pending alert.
+                try:
+                    prices[asset_key] = live.get_quote(asset).price
+                    continue
+                except QuoteUnavailable:
+                    logger.info("live quote unavailable for %s; falling back to candle close", asset_key)
                 try:
                     candles = market.get_candles(asset, settings.default_interval, 100)
                     prices[asset_key] = candles[-1].close
@@ -1649,6 +1864,65 @@ def decision_endpoint(asset_key: str):
     return jsonify(payload)
 
 
+@app.get("/price/<asset_key>")
+def price_endpoint(asset_key: str):
+    """Instant live quote as JSON: price, venue source and quote age."""
+    asset = resolve_asset(asset_key)
+    if asset is None:
+        return jsonify({"error": "unknown asset"}), 404
+    try:
+        quote = live.get_quote(asset)
+    except QuoteUnavailable:
+        return jsonify({"error": "no live quote for this asset", "asset": asset.key}), 503
+    return jsonify({
+        "asset": asset.key,
+        "name_ar": asset.name_ar,
+        "name_en": asset.name_en,
+        "price": quote.price,
+        "quote": asset.quote,
+        "source": quote.source,
+        "age_seconds": quote.age_seconds,
+        "as_of": quote.as_of.isoformat(),
+    })
+
+
+@app.get("/assets")
+def assets_endpoint():
+    """Full asset catalog grouped by class, from the same source the bot uses."""
+    wanted = (request.args.get("class") or "").strip().lower()
+    classes = [wanted] if wanted in ASSET_CLASS_ORDER else list(ASSET_CLASS_ORDER)
+    return jsonify({
+        "count": sum(len(assets_by_class(cls)) for cls in classes),
+        "classes": {
+            cls: [{"key": asset.key, "name_ar": asset.name_ar, "name_en": asset.name_en,
+                   "quote": asset.quote, "decimals": asset.price_decimals}
+                  for asset in assets_by_class(cls)]
+            for cls in classes
+        },
+    })
+
+
+@app.get("/binary/<asset_key>")
+def binary_endpoint(asset_key: str):
+    """Short-expiry CALL / PUT / WAIT verdict as JSON plus its rendered block.
+
+    Query params: lang (ar|en), refresh=1 to bypass the short cache.
+    """
+    asset = resolve_asset(asset_key)
+    if asset is None:
+        return jsonify({"error": "unknown asset"}), 404
+    lang = request.args.get("lang", "ar")
+    if lang not in ("ar", "en"):
+        return jsonify({"error": "lang must be ar or en"}), 400
+    try:
+        verdict = binary_verdict_for(asset, force=request.args.get("refresh") == "1")
+    except DataUnavailable:
+        return jsonify({"error": "no reliable 5m/15m data for this asset", "asset": asset.key}), 503
+    payload = binary_to_dict(verdict)
+    payload["report"] = render_binary(verdict, lang)
+    return jsonify(payload)
+
+
 def authorized() -> bool:
     return request.headers.get("X-Admin-Key", "") == settings.admin_api_key
 
@@ -1748,6 +2022,10 @@ def main():
     try:
         bot.set_my_commands([
             types.BotCommand("start", "البداية والأزرار / start and buttons"),
+            types.BotCommand("price", "سعر لحظي / live price"),
+            types.BotCommand("assets", "كتالوج الأصول / asset catalog"),
+            types.BotCommand("binary", "تداول ثنائي CALL/PUT / binary verdict"),
+            types.BotCommand("decision", "قرار صارم شراء/بيع/انتظار / strict verdict"),
             types.BotCommand("smc", "تحليل سيولة ذكية 4H/1H/15m / smart-money report"),
             types.BotCommand("analyze", "تحليل المؤشرات / indicator analysis"),
             types.BotCommand("chart", "شارت من بيانات حقيقية / real-data chart"),
