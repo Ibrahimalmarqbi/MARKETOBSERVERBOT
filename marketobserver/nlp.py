@@ -56,6 +56,8 @@ def _intent(text: str) -> str:
         return "decision"
     if re.search(r"(خيارات ثنائيه|تداول ثنائي|الخيارات الثنائيه|binary|باينري|ثنائي|كول او بوت|صعود او هبوط)", lowered):
         return "binary"
+    if re.search(r"(باك تست|باكتست|backtest|اختبار الاستراتيجيه|اختبار الماضي|جرب على الماضي|back test|اختبار تاريخي)", lowered):
+        return "backtest"
     if re.search(r"(تقويم|calendar|اجنده اقتصاديه|الأجندة|احداث اليوم|احداث الغد|مفكره اقتصاديه|event calendar|economic calendar)", lowered):
         return "calendar"
     if re.search(r"(دقتك|دقه البوت|ادائك|اداء البوت|احصائيات|احصائياتك|نتائجك|سجل ادائك|win rate|accuracy|performance|stats|how good are you|نتايجك)", lowered):

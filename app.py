@@ -33,6 +33,7 @@ from marketobserver.learning import calibration_for, resolve_due as resolve_jour
 from marketobserver.live import LivePriceProvider, Quote, QuoteUnavailable
 from marketobserver.market_data import DataUnavailable, MarketDataProvider
 from marketobserver.binary import decide as build_binary_verdict, render as render_binary, to_dict as binary_to_dict
+from marketobserver.backtest import HistoryUnavailable, backtest as run_backtest, render as render_backtest, to_dict as backtest_to_dict
 from marketobserver.research import MarketResearch, ResearchSnapshot, headline_age_hours, headline_fingerprint, headline_importance_level, is_fresh
 from marketobserver.risk import calculate_position_size
 from marketobserver.llm import GroundedLLM
@@ -70,13 +71,13 @@ app = Flask(__name__)
 
 
 AR = {
-    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، سعر البيتكوين، ثنائي EURUSD، ما أخبار التقويم اليوم؟ أو كم دقتك؟ الأوامر: /price و /assets و /binary و /calendar (التقويم الاقتصادي) و /stats (دقة البوت) و /capital (رأس مالك لحساب اللوت) و /analyze و /smc و /decision و /alert و /risk.",
+    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، سعر البيتكوين، ثنائي EURUSD، باك تست الذهب، ما أخبار التقويم اليوم؟ أو كم دقتك؟ الأوامر: /price و /assets و /binary و /backtest (اختبار الماضي) و /calendar و /stats و /capital و /analyze و /smc و /decision و /alert و /risk.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
-    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
 
 EN = {
-    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
 
 
@@ -776,6 +777,33 @@ def stats_cmd(message: types.Message):
     except Exception:
         logger.exception("stats failed")
         bot.reply_to(message, "تعذر حساب الإحصائيات حاليًا." if lang == "ar" else "Stats are unavailable right now.")
+
+
+@bot.message_handler(commands=["backtest", "bt"])
+def backtest_cmd(message: types.Message):
+    lang = user_language(message)
+    parts = (message.text or "").split()
+    asset_token = parts[1] if len(parts) >= 2 else None
+    asset = selected_asset(message, asset_token) if asset_token else selected_asset(message)
+    remember_user(message, asset)
+    if asset is None:
+        bot.reply_to(message, "اذكر الأصل مثل: /backtest EURUSD 30" if lang == "ar" else "Name an asset, for example /backtest EURUSD 30.")
+        return
+    try:
+        numbers = extract_numbers(" ".join(parts[2:])) if len(parts) >= 3 else []
+        days = max(7, min(60, int(numbers[0]))) if numbers else 30
+    except (ValueError, IndexError):
+        days = 30
+    bot.reply_to(message, f"🧪 أختبر {asset.key} على ~{days} يومًا... قد يستغرق هذا دقيقة." if lang == "ar" else f"🧪 Backtesting {asset.key} on ~{days} days... this can take a minute.")
+    try:
+        bot.send_chat_action(message.chat.id, "typing")
+        result = run_backtest(asset, days)
+        bot.send_message(message.chat.id, render_backtest(result, lang), parse_mode="HTML", disable_web_page_preview=True)
+    except HistoryUnavailable:
+        bot.reply_to(message, AR["data_error"] if lang == "ar" else "Not enough historical data for this backtest.")
+    except Exception:
+        logger.exception("backtest failed for %s", asset.key)
+        bot.reply_to(message, "تعذر إكمال الباك تست حاليًا." if lang == "ar" else "Backtest could not be completed right now.")
 
 
 @bot.message_handler(commands=["analyze"])
@@ -1759,6 +1787,27 @@ def text_cmd(message: types.Message):
             return
         binary_respond(message, asset, binary_lang)
         return
+    if request.intent == "backtest":
+        if asset is None:
+            bot.reply_to(message,
+                         "اذكر الأصل مع الباك تست، مثل: باك تست EURUSD أو backtest BTC." if lang == "ar" else
+                         "Name the asset with the backtest, for example: backtest EURUSD.")
+            return
+        try:
+            numbers = extract_numbers(text)
+            days = max(7, min(60, int(numbers[0]))) if numbers else 30
+        except (ValueError, IndexError):
+            days = 30
+        bot.reply_to(message, f"🧪 أختبر {asset.key} على ~{days} يومًا... قد يستغرق هذا دقيقة." if lang == "ar" else f"🧪 Backtesting {asset.key} on ~{days} days... this can take a minute.")
+        try:
+            result = run_backtest(asset, days)
+            bot.send_message(message.chat.id, render_backtest(result, lang), parse_mode="HTML", disable_web_page_preview=True)
+        except HistoryUnavailable:
+            bot.reply_to(message, AR["data_error"] if lang == "ar" else "Not enough historical data for this backtest.")
+        except Exception:
+            logger.exception("backtest NL failed")
+            bot.reply_to(message, "تعذر إكمال الباك تست حاليًا." if lang == "ar" else "Backtest could not be completed right now.")
+        return
     if request.intent == "calendar":
         try:
             for chunk in split_broadcast_text(calendar_list_text(lang, user_timezone(message))):
@@ -2463,6 +2512,31 @@ def stats_endpoint():
     })
 
 
+@app.get("/backtest/<asset_key>")
+def backtest_endpoint(asset_key: str):
+    """Walk-forward binary backtest. Query: days (7-60), payout, lang."""
+    asset = resolve_asset(asset_key)
+    if asset is None:
+        return jsonify({"error": "unknown asset"}), 404
+    try:
+        days = max(7, min(60, int(request.args.get("days", "30"))))
+        payout = float(request.args.get("payout", "0.8"))
+        if not 0 < payout <= 1:
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "days must be 7-60 and payout within (0, 1]"}), 400
+    lang = request.args.get("lang", "ar")
+    if lang not in {"ar", "en"}:
+        return jsonify({"error": "lang must be ar or en"}), 400
+    try:
+        result = run_backtest(asset, days, payout)
+    except HistoryUnavailable:
+        return jsonify({"error": "not enough historical data", "asset": asset.key}), 503
+    payload = backtest_to_dict(result)
+    payload["report"] = render_backtest(result, lang)
+    return jsonify(payload)
+
+
 def authorized() -> bool:
     return request.headers.get("X-Admin-Key", "") == settings.admin_api_key
 
@@ -2565,6 +2639,7 @@ def main():
             types.BotCommand("price", "سعر لحظي / live price"),
             types.BotCommand("assets", "كتالوج الأصول / asset catalog"),
             types.BotCommand("binary", "تداول ثنائي CALL/PUT / binary verdict"),
+            types.BotCommand("backtest", "اختبار الاستراتيجية على الماضي / backtest"),
             types.BotCommand("calendar", "التقويم الاقتصادي / economic calendar"),
             types.BotCommand("stats", "دقة البوت / bot accuracy"),
             types.BotCommand("capital", "رأس المال والمخاطرة / capital and risk"),
