@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 # second host is a reliability fix and never a different data source.
 BINANCE_HOSTS = ("https://api.binance.com", "https://data-api.binance.vision")
 BINANCE_PAIRS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "PAXG": "PAXGUSDT"}
-BINANCE_INTERVALS = {"15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d"}
+BINANCE_INTERVALS = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d"}
 KRAKEN_PAIRS = {"BTC": "XXBTZUSD", "ETH": "XETHZUSD", "SOL": "XSOLZUSD"}
-KRAKEN_INTERVALS = {"15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "1440"}
+KRAKEN_INTERVALS = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "1440"}
 
 
 class DataUnavailable(RuntimeError):
@@ -115,6 +115,10 @@ class MarketDataProvider:
         return self._source.get(asset_key)
 
     def _binance_pair(self, asset: Asset) -> str | None:
+        # Explicit venue symbols declared on the asset win: derivation can
+        # never point one asset at another asset's feed.
+        if getattr(asset, "binance", None):
+            return asset.binance
         if asset.key in BINANCE_PAIRS:
             return BINANCE_PAIRS[asset.key]
         # Other USD-quoted crypto listings map 1:1 onto Binance pairs
@@ -158,6 +162,8 @@ class MarketDataProvider:
         return []
 
     def _kraken_pair(self, asset: Asset) -> str | None:
+        if getattr(asset, "kraken", None):
+            return asset.kraken
         if asset.key in KRAKEN_PAIRS:
             return KRAKEN_PAIRS[asset.key]
         symbol = (asset.provider_symbol or "").upper()
@@ -201,7 +207,14 @@ class MarketDataProvider:
 
     def _yahoo(self, asset: Asset, interval: str, limit: int) -> list[Candle]:
         try:
-            period = "2y" if interval in {"1d", "1wk", "1mo"} else "60d"
+            # Yahoo caps 1m history at 7 days; requesting more fails the
+            # whole call, so short timeframes pin their own periods.
+            if interval in {"1d", "1wk", "1mo"}:
+                period = "2y"
+            elif interval == "1m":
+                period = "7d"
+            else:
+                period = "60d"
             fetch_interval = "1h" if interval == "4h" else interval
             frame = yf.Ticker(asset.provider_symbol).history(period=period, interval=fetch_interval, auto_adjust=False, actions=False)
             if interval == "4h" and frame is not None and not frame.empty:

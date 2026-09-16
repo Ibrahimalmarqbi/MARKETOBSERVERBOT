@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import io
+import json
 import logging
 import re
 import threading
@@ -20,15 +21,19 @@ import telebot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 
-from marketobserver.assets import ASSETS, Asset, resolve_asset
+from marketobserver.assets import ASSET_CLASS_NAMES, ASSET_CLASS_ORDER, ASSETS, BINARY_POPULAR, Asset, assets_by_class, resolve_asset
 from marketobserver.analysis import Analysis, analyze
 from marketobserver.advisor import Advice, build_advice
 from marketobserver.nlp import parse_request
 from marketobserver.broker import LiveBrokerNotConfigured, OrderRequest, PaperBroker
 from marketobserver.config import Settings
-from marketobserver.db import Database
+from marketobserver.db import Database, cooldown_active
+from marketobserver.calendar import COUNTRIES, EconomicCalendar, IMPACT_AR, IMPACT_EN
+from marketobserver.learning import calibration_for, resolve_due as resolve_journal_due, stats_report
+from marketobserver.live import LivePriceProvider, Quote, QuoteUnavailable
 from marketobserver.market_data import DataUnavailable, MarketDataProvider
-from marketobserver.research import MarketResearch, ResearchSnapshot, headline_fingerprint, headline_importance_level
+from marketobserver.binary import decide as build_binary_verdict, render as render_binary, to_dict as binary_to_dict
+from marketobserver.research import MarketResearch, ResearchSnapshot, headline_age_hours, headline_fingerprint, headline_importance_level, is_fresh
 from marketobserver.risk import calculate_position_size
 from marketobserver.llm import GroundedLLM
 from marketobserver.smc import build_report as build_smc_report
@@ -50,31 +55,35 @@ migrated_news_users = db.migrate_news_subscriptions()
 if migrated_news_users:
     logger.info("automatically enrolled %s active users in news alerts", migrated_news_users)
 market = MarketDataProvider()
+live = LivePriceProvider(settings.live_price_ttl_seconds)
 research = MarketResearch()
+calendar_feed = EconomicCalendar()
 llm = GroundedLLM(settings.llm_api_key, settings.llm_api_base, settings.llm_model)
 paper_broker = PaperBroker()
 live_broker = LiveBrokerNotConfigured()
 last_signal_scan_at = 0.0
 last_news_scan_at = 0.0
+last_calendar_scan_at = 0.0
+last_journal_scan_at = 0.0
 bot = telebot.TeleBot(settings.telegram_token, threaded=True)
 app = Flask(__name__)
 
 
 AR = {
-    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، هل أدخل البيتكوين؟ أو احسب مخاطرة رأس المال 10000 بنسبة 1% دخول 4715 وقف 4690. يمكنك أيضًا استخدام /analyze و /smc (تحليل سيولة ذكية بأزرار) و /decision (قرار صارم: شراء/بيع/انتظار) و /alert و /risk و /paperbuy.",
+    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، سعر البيتكوين، ثنائي EURUSD، ما أخبار التقويم اليوم؟ أو كم دقتك؟ الأوامر: /price و /assets و /binary و /calendar (التقويم الاقتصادي) و /stats (دقة البوت) و /capital (رأس مالك لحساب اللوت) و /analyze و /smc و /decision و /alert و /risk.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
-    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
 
 EN = {
-    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
 
 
 def unknown_asset_text(lang: str) -> str:
-    examples = "BTC, ETH, SOL, XAUUSD, XAGUSD, EURUSD, WTI, BRENT, GASOLINE, NATGAS, AAPL, TSLA, NVDA"
-    return ("لم أتعرف على الأصل. اكتب اسمًا أو رمزًا واضحًا، مثل: الذهب، الفضة، برنت، البنزين، BTC، EURUSD، أو AAPL."
-            if lang == "ar" else f"I could not identify the asset. Use a clear name or ticker, for example: {examples}.")
+    examples = "BTC, ETH, SOL, BNB, XRP, DOGE, XAUUSD, EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, WTI, AAPL, TSLA"
+    return ("لم أتعرف على الأصل. اكتب اسمًا أو رمزًا واضحًا، مثل: الذهب، البيتكوين، EURUSD، الباوند ين، أو DOGE — أو اعرض كل الأصول بـ /assets."
+            if lang == "ar" else f"I could not identify the asset. Use a clear name or ticker, for example: {examples}. See /assets for the full catalog.")
 
 
 def out_of_scope_response(lang: str) -> str:
@@ -327,6 +336,31 @@ def analysis_text(asset: Asset, result: Analysis, lang: str, tz_name: str = "Asi
     )
 
 
+def quote_text(asset: Asset, quote: Quote, lang: str) -> str:
+    name = asset.name_ar if lang == "ar" else asset.name_en
+    if lang == "ar":
+        return (f"💰 {name} ({asset.key}): {quote.price} {asset.quote}\n"
+                f"📡 المصدر: {quote.source} | عمر السعر: {quote.age_seconds:.1f} ثانية")
+    return (f"💰 {name} ({asset.key}): {quote.price} {asset.quote}\n"
+            f"📡 Source: {quote.source} | quote age: {quote.age_seconds:.1f}s")
+
+
+def assets_text(lang: str, asset_class: str | None = None) -> str:
+    classes = [asset_class] if asset_class in ASSET_CLASS_ORDER else list(ASSET_CLASS_ORDER)
+    total = sum(len(assets_by_class(cls)) for cls in classes)
+    lines = [f"📚 كتالوج الأصول ({total})" if lang == "ar" else f"📚 Asset catalog ({total})"]
+    for cls in classes:
+        names = ASSET_CLASS_NAMES[cls]
+        lines.append("")
+        lines.append(f"━━ {names[0] if lang == 'ar' else names[1]} ━━")
+        for asset in assets_by_class(cls):
+            label = asset.name_ar if lang == "ar" else asset.name_en
+            lines.append(f"• {asset.key} — {label}")
+    lines.append("")
+    lines.append("مثال: /price EURUSD أو /binary BTC أو /smc الذهب" if lang == "ar" else "Examples: /price EURUSD, /binary BTC, /smc gold")
+    return "\n".join(lines)
+
+
 def translate_advice_reason(reason: str, lang: str) -> str:
     if lang != "ar":
         return reason
@@ -519,13 +553,28 @@ def _news_guidance(sentiment: str, lang: str) -> tuple[str, str]:
     return before, after
 
 
+def _headline_age_text(item, lang: str) -> str:
+    age = headline_age_hours(item)
+    if age is None:
+        return "الآن" if lang == "ar" else "now"
+    if age < 1:
+        minutes = max(1, int(age * 60))
+        return f"قبل {minutes} د" if lang == "ar" else f"{minutes}m ago"
+    if age < 24:
+        return f"قبل {age:.0f} س" if lang == "ar" else f"{age:.0f}h ago"
+    return f"قبل {age / 24:.0f} يوم" if lang == "ar" else f"{age / 24:.0f}d ago"
+
+
 def news_alert_text(asset: Asset, items, lang: str, tz_name: str) -> str:
-    now = format_timestamp(datetime.now(timezone.utc), lang, tz_name)
+    """Compact auto-alert: one story, impact label, age, source link.
+
+    The engine sends a single top story per cycle (see the news scanner), so
+    this format stays short enough to read at a glance; a second item is only
+    ever rendered for manual calls, never for automatic bursts.
+    """
     asset_name = asset.name_ar if lang == "ar" else asset.name_en
     lines = [
-        f"🚨 <b>خبر مهم</b> | <b>{html.escape(asset_name)} ({asset.key})</b>" if lang == "ar" else f"🚨 <b>Important news</b> | <b>{html.escape(asset_name)} ({asset.key})</b>",
-        f"🕒 وقت الإرسال: {html.escape(now)}" if lang == "ar" else f"🕒 Alert time: {html.escape(now)}",
-        "",
+        f"🚨 <b>خبر عالي التأثير</b> | <b>{html.escape(asset_name)} ({asset.key})</b>" if lang == "ar" else f"🚨 <b>High-impact news</b> | <b>{html.escape(asset_name)} ({asset.key})</b>",
     ]
     for index, item in enumerate(items[:2]):
         headline, source_from_title = _headline_parts(item.title)
@@ -534,32 +583,24 @@ def news_alert_text(asset: Asset, items, lang: str, tz_name: str) -> str:
         level = headline_importance_level(item)
         if lang == "ar":
             level_label = {"high": "عالية", "medium": "متوسطة", "low": "منخفضة"}.get(level, level)
-            sentiment_label = {"positive": "إيجابي", "negative": "سلبي", "neutral": "محايد"}.get(item.sentiment, "محايد")
-            impact = "قد يرفع التقلب والسيولة على المدى القصير؛ لا يعني اتجاهًا مضمونًا."
-            before, after = _news_guidance(item.sentiment, lang)
+            sentiment_label = {"positive": "إيجابي 📈", "negative": "سلبي 📉", "neutral": "محايد"}.get(item.sentiment, "محايد")
             lines.extend([
-                f"<b>{index + 1}. {html.escape(headline[:220])}</b>",
+                "",
+                f"<b>{html.escape(headline[:220])}</b>",
                 f"🟠 الأهمية: <b>{level_label}</b> | النبرة: {sentiment_label}",
-                f"🕒 الخبر: {html.escape(_news_time(item.published, lang, tz_name))} | المصدر: {html.escape(source)}",
-                f"📌 الأثر المحتمل: {impact}",
-                f"🛡 قبل الخبر: {before}",
-                f"✅ بعد الخبر: {after}",
+                f"🕒 {_headline_age_text(item, lang)} | المصدر: {html.escape(source)}",
             ])
         else:
-            impact = "May increase short-term volatility and liquidity; it does not guarantee direction."
-            before, after = _news_guidance(item.sentiment, lang)
             lines.extend([
-                f"<b>{index + 1}. {html.escape(headline[:220])}</b>",
+                "",
+                f"<b>{html.escape(headline[:220])}</b>",
                 f"🟠 Importance: <b>{level}</b> | tone: {html.escape(item.sentiment)}",
-                f"🕒 Published: {html.escape(_news_time(item.published, lang, tz_name))} | source: {html.escape(source)}",
-                f"📌 Potential impact: {impact}",
-                f"🛡 Before news: {before}",
-                f"✅ After news: {after}",
+                f"🕒 {_headline_age_text(item, lang)} | source: {html.escape(source)}",
             ])
         if item.link:
             lines.append(f"🔗 <a href=\"{html.escape(item.link, quote=True)}\">فتح المصدر الأصلي</a>" if lang == "ar" else f"🔗 <a href=\"{html.escape(item.link, quote=True)}\">Open original source</a>")
-        lines.append("")
-    lines.append("ℹ️ تنبيه بحثي: تحقق من الخبر الأصلي، ولا تعتبره أمرًا مباشرًا بالتداول." if lang == "ar" else "ℹ️ Research alert: verify the original article; this is not a direct trading order.")
+    lines.append("")
+    lines.append("📌 أراقب تأثيره على السعر وسأخبرك إذا تحرك السوق بقوة." if lang == "ar" else "📌 Watching its price impact — I will report back if the market moves strongly.")
     return "\n".join(lines)
 
 
@@ -610,6 +651,131 @@ def timezone_cmd(message: types.Message):
         return
     db.set_timezone(message.chat.id, tz_name)
     bot.reply_to(message, f"تم ضبط التوقيت على {tz_name}." if lang == "ar" else f"Timezone set to {tz_name}.")
+
+
+@bot.message_handler(commands=["price"])
+def price_cmd(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    asset = selected_asset(message, parts[1] if len(parts) == 2 else None)
+    remember_user(message, asset)
+    lang = user_language(message)
+    if not asset:
+        bot.reply_to(message, unknown_asset_text(lang))
+        return
+    try:
+        quote = live.get_quote(asset)
+        bot.reply_to(message, quote_text(asset, quote, lang))
+    except QuoteUnavailable:
+        bot.reply_to(message, AR["data_error"] if lang == "ar" else "No live quote is available for this asset right now.")
+    except Exception:
+        logger.exception("price failed for %s", asset.key)
+        bot.reply_to(message, "تعذر جلب السعر مؤقتًا." if lang == "ar" else "Price lookup failed temporarily.")
+
+
+@bot.message_handler(commands=["assets"])
+def assets_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    parts = message.text.split(maxsplit=1)
+    wanted = (parts[1].strip().lower() if len(parts) == 2 else "")
+    aliases = {"crypto": "crypto", "كريبتو": "crypto", "رقمية": "crypto",
+               "forex": "forex", "فوركس": "forex", "عملات": "forex",
+               "metals": "metals", "معادن": "metals", "ذهب": "metals",
+               "commodity": "commodity", "commodities": "commodity", "سلع": "commodity", "نفط": "commodity",
+               "index": "index", "indices": "index", "مؤشرات": "index",
+               "stock": "stock", "stocks": "stock", "أسهم": "stock", "اسهم": "stock"}
+    asset_class = aliases.get(wanted)
+    if wanted and not asset_class:
+        bot.reply_to(message, "استخدم: /assets [crypto|forex|metals|commodity|index|stock]" if lang == "ar" else "Usage: /assets [crypto|forex|metals|commodity|index|stock]")
+        return
+    for chunk in split_broadcast_text(assets_text(lang, asset_class)):
+        bot.send_message(message.chat.id, chunk)
+
+
+@bot.message_handler(commands=["capital"])
+def capital_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    parts = (message.text or "").split()
+    if len(parts) == 1:
+        user = db.get_user(message.chat.id)
+        capital = user.capital if user and user.capital else 1000.0
+        risk_pct = user.risk_percent if user and user.risk_percent else 1.0
+        bot.reply_to(message, f"💰 رأس مالك المسجل: {capital:g}$ | مخاطرة الصفقة: {risk_pct:g}%. غيّرهما بـ: /capital 2000 1" if lang == "ar" else f"💰 Registered capital: ${capital:g} | per-trade risk: {risk_pct:g}%. Change with: /capital 2000 1")
+        return
+    try:
+        numbers = extract_numbers(" ".join(parts[1:]))
+        if not numbers or numbers[0] <= 0:
+            raise ValueError
+        db.set_capital(message.chat.id, float(numbers[0]))
+        if len(numbers) >= 2:
+            if not 0 < numbers[1] <= 10:
+                raise ValueError
+            db.set_risk_percent(message.chat.id, float(numbers[1]))
+        user = db.get_user(message.chat.id)
+        bot.reply_to(message, f"✅ تم: رأس المال {user.capital:g}$ | مخاطرة {user.risk_percent:g}% لكل صفقة." if lang == "ar" else f"✅ Saved: capital ${user.capital:g} | risk {user.risk_percent:g}% per trade.")
+    except (ValueError, IndexError):
+        bot.reply_to(message, "الاستخدام: /capital رأس_المال [نسبة_المخاطرة] — مثال: /capital 2000 1" if lang == "ar" else "Usage: /capital CAPITAL [RISK_PERCENT] — example: /capital 2000 1")
+
+
+def calendar_list_text(lang: str, tz_name: str, hours: int = 24) -> str:
+    events = [event for event in calendar_feed.upcoming(hours, ("High", "Medium"))]
+    if lang == "ar":
+        if not events:
+            return "📅 لا توجد أحداث عالية/متوسطة التأثير خلال 24 ساعة القادمة."
+        lines = ["📅 <b>التقويم الاقتصادي — 24 ساعة</b>", ""]
+        for event in events[:15]:
+            when = format_timestamp(event.event_time, lang, tz_name)
+            lines.append(f"{event.stars} <b>{html.escape(event.title)}</b> | {_country_label(event.country, lang)}")
+            exp = f"متوقع {event.forecast} | سابق {event.previous}" if (event.forecast or event.previous) else "بدون توقع رقمي"
+            lines.append(f"🕒 {html.escape(when)} | {_impact_label(event.impact, lang)} | {html.escape(exp)}")
+            lines.append("")
+        lines.append("سأذكرك قبل الأحداث عالية التأثير وأتابع رد الفعل مع خطة.")
+        return "\n".join(lines)
+    if not events:
+        return "📅 No high/medium-impact events in the next 24 hours."
+    lines = ["📅 <b>Economic calendar — 24h</b>", ""]
+    for event in events[:15]:
+        when = format_timestamp(event.event_time, lang, tz_name)
+        lines.append(f"{event.stars} <b>{html.escape(event.title)}</b> | {_country_label(event.country, lang)}")
+        exp = f"forecast {event.forecast} | previous {event.previous}" if (event.forecast or event.previous) else "no numeric forecast"
+        lines.append(f"🕒 {html.escape(when)} | {_impact_label(event.impact, lang)} | {html.escape(exp)}")
+        lines.append("")
+    lines.append("I will remind you before high-impact events and follow the reaction with a plan.")
+    return "\n".join(lines)
+
+
+@bot.message_handler(commands=["calendar", "cal"])
+def calendar_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) == 2 else ""
+    if arg in {"off", "ايقاف", "إيقاف"}:
+        db.set_calendar_enabled(message.chat.id, False)
+        bot.reply_to(message, "تم إيقاف تنبيهات التقويم." if lang == "ar" else "Calendar alerts disabled.")
+        return
+    if arg in {"on", "تشغيل"}:
+        db.set_calendar_enabled(message.chat.id, True)
+        bot.reply_to(message, "تم تفعيل تنبيهات التقويم." if lang == "ar" else "Calendar alerts enabled.")
+        return
+    try:
+        for chunk in split_broadcast_text(calendar_list_text(lang, user_timezone(message))):
+            bot.send_message(message.chat.id, chunk, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        logger.exception("calendar list failed")
+        bot.reply_to(message, "تعذر جلب التقويم حاليًا." if lang == "ar" else "Calendar is unavailable right now.")
+
+
+@bot.message_handler(commands=["stats", "accuracy"])
+def stats_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    try:
+        bot.reply_to(message, stats_report(db, lang))
+    except Exception:
+        logger.exception("stats failed")
+        bot.reply_to(message, "تعذر حساب الإحصائيات حاليًا." if lang == "ar" else "Stats are unavailable right now.")
 
 
 @bot.message_handler(commands=["analyze"])
@@ -749,8 +915,9 @@ def paper_order_cmd(message: types.Message):
 # the report text is assembled from its structured output.
 
 SMC_TIMEFRAMES = ("4h", "1h", "15m")
-SMC_PRIMARY_ASSETS = ("BTC", "ETH", "SOL", "XAUUSD", "EURUSD", "WTI")
-SMC_MORE_ASSETS = ("PAXG", "XAGUSD", "BRENT", "NATGAS", "DXY", "AAPL", "TSLA", "NVDA", "QQQ")
+SMC_PRIMARY_ASSETS = ("BTC", "ETH", "XAUUSD", "EURUSD", "GBPUSD", "USDJPY")
+SMC_MORE_ASSETS = ("SOL", "PAXG", "XAGUSD", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "GBPJPY",
+                   "WTI", "BRENT", "NATGAS", "DXY", "AAPL", "TSLA", "NVDA", "QQQ")
 SMC_MODES = ("brief", "full")
 # Per-chat UI preference. The process is single-worker by design (Telegram
 # polling and the alert loop run in this process), so an in-memory dict is the
@@ -804,7 +971,9 @@ def smc_keyboard(asset_key: str, lang: str, mode: str) -> types.InlineKeyboardMa
     mode = mode if mode in SMC_MODES else "full"
     keyboard = types.InlineKeyboardMarkup(row_width=3)
     names = {"BTC": "₿ BTC", "ETH": "Ξ ETH", "SOL": "◎ SOL", "XAUUSD": "🥇 XAU", "EURUSD": "💶 EUR", "WTI": "🛢 WTI",
-             "PAXG": "🥈 PAXG", "XAGUSD": "⚪️ XAG", "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS", "DXY": "💵 DXY",
+             "PAXG": "🥈 PAXG", "XAGUSD": "⚪️ XAG", "GBPUSD": "💷 GBP", "USDJPY": "💴 JPY", "AUDUSD": "🦘 AUD",
+             "USDCAD": "🍁 CAD", "USDCHF": "🇨🇭 CHF", "NZDUSD": "🥝 NZD", "EURJPY": "🇪🇺JPY", "GBPJPY": "🇬🇧JPY",
+             "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS", "DXY": "💵 DXY",
              "AAPL": "🍎 AAPL", "TSLA": "🚗 TSLA", "NVDA": "🎮 NVDA", "QQQ": "📈 QQQ"}
     for row in (SMC_PRIMARY_ASSETS[:3], SMC_PRIMARY_ASSETS[3:]):
         keyboard.add(*[types.InlineKeyboardButton(("✅ " if key == asset_key else "") + names.get(key, key),
@@ -938,7 +1107,9 @@ def smc_cmd(message: types.Message):
 
 
 SMC_BUTTON_NAMES = {"BTC": "₿ BTC", "ETH": "Ξ ETH", "SOL": "◎ SOL", "PAXG": "🥈 PAXG", "XAUUSD": "🥇 XAU",
-                    "XAGUSD": "⚪️ XAG", "EURUSD": "💶 EUR", "WTI": "🛢 WTI", "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS",
+                    "XAGUSD": "⚪️ XAG", "EURUSD": "💶 EUR", "GBPUSD": "💷 GBP", "USDJPY": "💴 JPY", "AUDUSD": "🦘 AUD",
+                    "USDCAD": "🍁 CAD", "USDCHF": "🇨🇭 CHF", "NZDUSD": "🥝 NZD", "EURJPY": "🇪🇺JPY", "GBPJPY": "🇬🇧JPY",
+                    "WTI": "🛢 WTI", "BRENT": "🛢 BRENT", "NATGAS": "🔥 GAS",
                     "DXY": "💵 DXY", "AAPL": "🍎 AAPL", "TSLA": "🚗 TSLA", "NVDA": "🎮 NVDA", "QQQ": "📈 QQQ"}
 
 
@@ -1177,6 +1348,127 @@ def decision_callback(call: types.CallbackQuery):
         return
     decision_respond(call.message, asset, lang, verbose in {"1", "true"}, force=force == "1",
                      edit_message_id=call.message.message_id if call.message else None)
+    bot.answer_callback_query(call.id)
+
+
+# --------------------------------------------------------------------------- #
+# Binary engine (/binary): CALL / PUT / WAIT on 15m context + 5m execution.
+# Built for short-expiry binary-style trading; the strict gate chain lives in
+# marketobserver/binary.py and this layer only fetches candles, attaches the
+# live reference price and renders the verdict.
+# --------------------------------------------------------------------------- #
+BINARY_TIMEFRAMES = ("5m", "15m")
+BINARY_TTL_SECONDS = 30
+binary_cache: dict[str, tuple[float, object]] = {}
+
+
+def binary_verdict_for(asset: Asset, force: bool = False):
+    cached = binary_cache.get(asset.key)
+    if cached and not force and time.time() - cached[0] < BINARY_TTL_SECONDS:
+        return cached[1]
+    candles: dict[str, list] = {}
+    for timeframe in BINARY_TIMEFRAMES:
+        try:
+            candles[timeframe] = market.get_candles(asset, timeframe, 120)
+        except DataUnavailable:
+            continue
+    if "5m" not in candles or "15m" not in candles:
+        raise DataUnavailable(f"binary needs 5m and 15m candles for {asset.key}")
+    try:
+        live_price = live.get_quote(asset).price
+    except QuoteUnavailable:
+        live_price = None
+    verdict = build_binary_verdict(asset.key, asset.name_ar, asset.name_en, asset.quote,
+                                   asset.price_decimals, candles["5m"], candles["15m"],
+                                   market.last_source(asset.key) or "unknown", live_price)
+    binary_cache[asset.key] = (time.time(), verdict)
+    return verdict
+
+
+def binary_keyboard(asset_key: str, lang: str) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    for index in range(0, len(BINARY_POPULAR), 3):
+        row = BINARY_POPULAR[index:index + 3]
+        keyboard.add(*[types.InlineKeyboardButton(
+            ("✅ " if key == asset_key else "") + SMC_BUTTON_NAMES.get(key, key),
+            callback_data=f"bin:run:{key}:{lang}:0") for key in row])
+    keyboard.add(
+        types.InlineKeyboardButton("🔄 تحديث" if lang == "ar" else "🔄 Refresh",
+                                   callback_data=f"bin:run:{asset_key}:{lang}:1"),
+        types.InlineKeyboardButton("🇸🇦 عربي" if lang == "ar" else "🇸🇦 AR",
+                                   callback_data=f"bin:run:{asset_key}:ar:0"),
+        types.InlineKeyboardButton("🇬🇧 EN", callback_data=f"bin:run:{asset_key}:en:0"),
+    )
+    return keyboard
+
+
+def binary_respond(target_message, asset: Asset, lang: str, force: bool = False,
+                   edit_message_id: int | None = None) -> None:
+    markup = binary_keyboard(asset.key, lang)
+    try:
+        verdict = binary_verdict_for(asset, force=force)
+    except DataUnavailable:
+        text = "⛔ " + (AR["data_error"] if lang == "ar" else
+                        "Reliable 5m/15m market data is unavailable for this asset right now, so no binary verdict is produced.")
+        deliver_smc(target_message.chat.id, text, markup, edit_message_id=edit_message_id)
+        return
+    except Exception:
+        logger.exception("binary verdict failed for %s", asset.key)
+        deliver_smc(target_message.chat.id,
+                      "⛔ " + ("تعذر إكمال القرار الثنائي الآن. جرّب التحديث." if lang == "ar" else
+                              "The binary verdict could not be completed. Try Refresh."),
+                      markup, edit_message_id=edit_message_id)
+        return
+    text = render_binary(verdict, lang)
+    if verdict.verdict in {"CALL", "PUT"}:
+        # Learning loop: journal every directional call and check it later.
+        ref = verdict.live_price or verdict.reference_price
+        if ref:
+            try:
+                db.journal_add("binary", asset.key, verdict.verdict, ref,
+                               verdict.expiry_minutes or 15, chat_id=target_message.chat.id,
+                               note=f"conf:{verdict.confidence}")
+            except Exception:
+                logger.exception("binary journal failed")
+        calibration = calibration_for(db, asset.key, verdict.verdict)
+        if calibration.downgrade:
+            text += "\n" + (calibration.note_ar if lang == "ar" else calibration.note_en)
+    deliver_smc(target_message.chat.id, text, markup, edit_message_id)
+
+
+@bot.message_handler(commands=["binary", "bin"])
+def binary_cmd(message: types.Message):
+    parts = (message.text or "").split(maxsplit=1)
+    lang = user_language(message)
+    asset = selected_asset(message, parts[1] if len(parts) == 2 else None)
+    remember_user(message, asset)
+    if asset is None:
+        bot.reply_to(message,
+                     "اذكر الأصل مثل: /binary EURUSD أو /binary الذهب." if lang == "ar" else
+                     "Name an asset, for example /binary EURUSD or /binary gold.",
+                     reply_markup=binary_keyboard("EURUSD", lang))
+        return
+    prefs = smc_prefs.setdefault(message.chat.id, {})
+    prefs["lang"] = lang
+    binary_respond(message, asset, lang, force=True)
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("bin:")))
+def binary_callback(call: types.CallbackQuery):
+    parts = (call.data or "").split(":")
+    if len(parts) < 5:
+        bot.answer_callback_query(call.id)
+        return
+    _, _, asset_key, lang, force = parts[:5]
+    lang = lang if lang in ("ar", "en") else "ar"
+    asset = ASSETS.get(asset_key) or resolve_asset(asset_key)
+    if asset is None:
+        bot.answer_callback_query(call.id, "أصل غير معروف" if lang == "ar" else "Unknown asset", show_alert=True)
+        return
+    smc_prefs.setdefault(call.message.chat.id, {})["lang"] = lang
+    db.set_last_asset(call.message.chat.id, asset.key)
+    binary_respond(call.message, asset, lang, force=force == "1",
+                   edit_message_id=call.message.message_id if call.message else None)
     bot.answer_callback_query(call.id)
 
 
@@ -1439,6 +1731,49 @@ def text_cmd(message: types.Message):
             return
         decision_respond(message, asset, decision_lang)
         return
+    if request.intent == "price":
+        # "سعر الذهب؟", "BTC price" -> instant live quote, never a stale close.
+        if asset is None:
+            bot.reply_to(message,
+                         "اذكر الأصل مع السعر، مثل: سعر الذهب أو BTC price." if lang == "ar" else
+                         "Name the asset with the price request, for example: gold price or BTC price.")
+            return
+        try:
+            bot.reply_to(message, quote_text(asset, live.get_quote(asset), lang))
+        except QuoteUnavailable:
+            bot.reply_to(message, AR["data_error"] if lang == "ar" else "No live quote is available for this asset right now.")
+        except Exception:
+            logger.exception("live price failed")
+            bot.reply_to(message, "تعذر جلب السعر حاليًا." if lang == "ar" else "Price lookup failed right now.")
+        return
+    if request.intent == "binary":
+        # "ثنائي EURUSD", "binary gold" -> the short-expiry CALL/PUT engine.
+        prefs = smc_prefs.setdefault(message.chat.id, {})
+        binary_lang = lang if lang in ("ar", "en") else prefs.get("lang", "ar")
+        prefs["lang"] = binary_lang
+        if asset is None:
+            bot.reply_to(message,
+                         "اذكر الأصل مع طلب الثنائي، مثل: ثنائي EURUSD أو binary BTC." if lang == "ar" else
+                         "Name the asset with the request, for example: binary EURUSD or ثنائي الذهب.",
+                         reply_markup=binary_keyboard("EURUSD", binary_lang))
+            return
+        binary_respond(message, asset, binary_lang)
+        return
+    if request.intent == "calendar":
+        try:
+            for chunk in split_broadcast_text(calendar_list_text(lang, user_timezone(message))):
+                bot.send_message(message.chat.id, chunk, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            logger.exception("calendar NL failed")
+            bot.reply_to(message, "تعذر جلب التقويم حاليًا." if lang == "ar" else "Calendar is unavailable right now.")
+        return
+    if request.intent == "stats":
+        try:
+            bot.reply_to(message, stats_report(db, lang))
+        except Exception:
+            logger.exception("stats NL failed")
+            bot.reply_to(message, "تعذر حساب الإحصائيات حاليًا." if lang == "ar" else "Stats are unavailable right now.")
+        return
     if request.intent == "risk":
         natural_risk_response(message, lang, text)
         return
@@ -1492,8 +1827,349 @@ def text_cmd(message: types.Message):
         bot.reply_to(message, "اذكر اسم الأصل مثل الذهب أو BTC أو AAPL، أو اكتب سؤالك مع اسم الأصل." if lang == "ar" else "Mention an asset such as gold, BTC, or AAPL with your question.")
 
 
+# --------------------------------------------------------------------------- #
+# Economic calendar engine + decision journal resolver.
+#
+# High-impact events flow through three exactly-once stages (tracked in the
+# calendar_state table, so restarts can neither duplicate nor skip a stage):
+#   1. pre-brief ~30 min before (expectations + affected assets + caution)
+#   2. release ping at event time (live price snapshot for later measuring)
+#   3. follow-up ~30 min after (measured market reaction + verdict + plan)
+# Events sharing a country and a 5-minute window are grouped into ONE message
+# so correlated releases (e.g. the three CAD CPI prints) never spam.
+# --------------------------------------------------------------------------- #
+NEWS_IMPACT_THRESHOLD = {
+    "crypto": 0.008, "forex": 0.002, "metals": 0.003,
+    "commodity": 0.005, "index": 0.004, "stock": 0.008, "custom": 0.005,
+}
+CALENDAR_FOLLOWUP_MINUTES = 30
+CALENDAR_PRE_MINUTES = 30
+
+
+def live_price_for(asset_key: str) -> float | None:
+    asset = ASSETS.get(asset_key)
+    if not asset:
+        return None
+    try:
+        return live.get_quote(asset).price
+    except QuoteUnavailable:
+        pass
+    try:
+        return market.get_candles(asset, settings.default_interval, 100)[-1].close
+    except DataUnavailable:
+        return None
+
+
+def _country_label(country: str, lang: str) -> str:
+    name, flag = COUNTRIES.get(country, (country, "🏳️"))
+    return f"{name} {flag}" if lang == "ar" else f"{country} {flag}"
+
+
+def _impact_label(impact: str, lang: str) -> str:
+    names = IMPACT_AR if lang == "ar" else IMPACT_EN
+    return names.get(impact, impact)
+
+
+def _group_calendar_events(events) -> list[list]:
+    """Group correlated releases (same country, same 5-minute bucket).
+
+    Groups come out in time order so messages always read chronologically.
+    """
+    buckets: dict[tuple[str, int], list] = {}
+    for event in sorted(events, key=lambda item: item.event_time):
+        bucket = int(event.event_time.timestamp() // 300)
+        buckets.setdefault((event.country, bucket), []).append(event)
+    return sorted(buckets.values(), key=lambda group: group[0].event_time)
+
+
+def calendar_pre_text(group, lang: str, tz_name: str) -> str:
+    first = group[0]
+    titles = " + ".join(event.title for event in group[:3])
+    when = format_timestamp(first.event_time, lang, tz_name)
+    assets = sorted({key for event in group for key in event.assets})[:4]
+    if lang == "ar":
+        lines = [
+            f"⏳ <b>بعد قليل: {html.escape(titles)}</b>",
+            f"{_country_label(first.country, lang)} | {first.stars} {_impact_label(first.impact, lang)}",
+            f"🕒 الموعد: {html.escape(when)}",
+        ]
+        for event in group[:3]:
+            if event.forecast or event.previous:
+                lines.append(f"🔮 {html.escape(event.title)}: متوقع {html.escape(event.forecast or '—')} | سابق {html.escape(event.previous or '—')}")
+        if assets:
+            lines.append(f"🎯 الأصول المتأثرة: {', '.join(assets)}")
+        lines.append("💡 قلل المخاطرة قبل الخبر: صغّر اللوت أو ضيّق الوقف — سأرسل التحليل لحظة الصدور وبعده.")
+        return "\n".join(lines)
+    lines = [
+        f"⏳ <b>Coming up: {html.escape(titles)}</b>",
+        f"{_country_label(first.country, lang)} | {first.stars} {_impact_label(first.impact, lang)}",
+        f"🕒 At: {html.escape(when)}",
+    ]
+    for event in group[:3]:
+        if event.forecast or event.previous:
+            lines.append(f"🔮 {html.escape(event.title)}: forecast {html.escape(event.forecast or '—')} | previous {html.escape(event.previous or '—')}")
+    if assets:
+        lines.append(f"🎯 Watch: {', '.join(assets)}")
+    lines.append("💡 Reduce risk into the release: smaller size or tighter stop — I will report at release and after.")
+    return "\n".join(lines)
+
+
+def calendar_release_text(group, prices: dict[str, float], lang: str) -> str:
+    first = group[0]
+    titles = " + ".join(event.title for event in group[:3])
+    if lang == "ar":
+        lines = [
+            f"{first.stars} <b>صدر الآن: {html.escape(titles)}</b>",
+            f"{_country_label(first.country, lang)} | {_impact_label(first.impact, lang)}",
+            "",
+            "💰 أسعار لحظة الصدور (مرجع القياس):",
+        ]
+    else:
+        lines = [
+            f"{first.stars} <b>Released: {html.escape(titles)}</b>",
+            f"{_country_label(first.country, lang)} | {_impact_label(first.impact, lang)}",
+            "",
+            "💰 Release-time prices (reaction baseline):",
+        ]
+    for key in sorted(prices):
+        lines.append(f"• {key}: {prices[key]:g}")
+    lines.append("")
+    lines.append("⚠️ أول دقائق = تذبذب عنيف وسبريد واسع؛ لا تطارد الحركة. سأرسل تحليل رد الفعل بعد 30 دقيقة مع خطة واضحة." if lang == "ar" else "⚠️ First minutes = violent chop and wide spreads; do not chase. I will send the reaction analysis with a clear plan in 30 minutes.")
+    return "\n".join(lines)
+
+
+def event_trade_plan(asset: Asset, direction: str, capital: float, risk_pct: float, lang: str) -> str | None:
+    """Theoretical entry/SL/TP + lot size from 15m ATR. None when unmeasurable."""
+    try:
+        candles = market.get_candles(asset, "15m", 120)
+        result = analyze(candles, asset.price_decimals)
+    except (DataUnavailable, ValueError):
+        return None
+    atr = max(result.atr14, result.price * 0.0005)
+    entry = result.price
+    sl_dist = atr * 1.5
+    risk_amount = max(capital, 0) * max(risk_pct, 0) / 100
+    if risk_amount <= 0 or sl_dist <= 0:
+        return None
+    if direction == "BUY":
+        stop, tp1, tp2 = entry - sl_dist, entry + sl_dist * 2, entry + sl_dist * 3
+    else:
+        stop, tp1, tp2 = entry + sl_dist, entry - sl_dist * 2, entry - sl_dist * 3
+    units = risk_amount / sl_dist
+    if asset.asset_class == "metals" and asset.key in {"XAUUSD", "XAGUSD"}:
+        size_text = f"{units / 100:.2f} لوت (1 لوت = 100 أونصة)" if lang == "ar" else f"{units / 100:.2f} lots (1 lot = 100 oz)"
+    elif asset.asset_class == "forex":
+        size_text = f"≈ {units / 100000:.2f} لوت (تقريبي)" if lang == "ar" else f"≈ {units / 100000:.2f} lots (approx)"
+    elif asset.asset_class == "crypto":
+        size_text = f"{units:.4f} {asset.key}" if lang == "ar" else f"{units:.4f} {asset.key}"
+    else:
+        size_text = f"{units:.2f} وحدة" if lang == "ar" else f"{units:.2f} units"
+    if lang == "ar":
+        return (
+            f"📋 <b>خطة نظرية ({'شراء' if direction == 'BUY' else 'بيع'} {asset.key})</b>\n"
+            f"🎯 دخول: {entry:g} | 🛑 وقف: {stop:g} | ✅ هدف1: {tp1:g} | هدف2: {tp2:g}\n"
+            f"💰 رأس مالك: {capital:g}$ | مخاطرة {risk_pct:g}% = {risk_amount:.2f}$\n"
+            f"📦 الحجم المقترح: {size_text}\n"
+            f"⚠️ خطة حسابية للتجربة أولًا — ليست توصية مالية."
+        )
+    return (
+        f"📋 <b>Theoretical plan ({direction} {asset.key})</b>\n"
+        f"🎯 Entry: {entry:g} | 🛑 SL: {stop:g} | ✅ TP1: {tp1:g} | TP2: {tp2:g}\n"
+        f"💰 Capital: ${capital:g} | risk {risk_pct:g}% = ${risk_amount:.2f}\n"
+        f"📦 Suggested size: {size_text}\n"
+        f"⚠️ A calculated draft for demo first — not financial advice."
+    )
+
+
+def calendar_followup_text(group, moves: list[tuple[str, float, float]], verdict_line: str,
+                           plan_text: str | None, lang: str) -> str:
+    first = group[0]
+    titles = " + ".join(event.title for event in group[:3])
+    if lang == "ar":
+        lines = [
+            f"📊 <b>رد فعل السوق: {html.escape(titles)}</b>",
+            f"{_country_label(first.country, lang)} | بعد {CALENDAR_FOLLOWUP_MINUTES} دقيقة من الصدور",
+            "",
+        ]
+    else:
+        lines = [
+            f"📊 <b>Market reaction: {html.escape(titles)}</b>",
+            f"{_country_label(first.country, lang)} | {CALENDAR_FOLLOWUP_MINUTES} min after release",
+            "",
+        ]
+    for key, ref, current in moves:
+        asset = ASSETS.get(key)
+        decimals = asset.price_decimals if asset else 4
+        pct = (current - ref) / ref * 100 if ref else 0.0
+        arrow = "🟢" if pct > 0.02 else "🔴" if pct < -0.02 else "⚪"
+        lines.append(f"{arrow} {key}: {ref:g} ← {current:g} ({pct:+.2f}%)")
+    lines += ["", verdict_line]
+    if plan_text:
+        lines += ["", plan_text]
+    return "\n".join(lines)
+
+
+def scan_calendar(now_utc: datetime) -> None:
+    """Run the three event stages. Safe to call every minute."""
+    try:
+        pre_due = calendar_feed.due_for_pre(CALENDAR_PRE_MINUTES)
+        release_due = calendar_feed.due_for_release()
+        followup_due = calendar_feed.due_for_followup(CALENDAR_FOLLOWUP_MINUTES)
+    except Exception:
+        logger.exception("calendar scan failed")
+        return
+    users = db.calendar_users()
+    if not users:
+        return
+
+    for group in _group_calendar_events(pre_due):
+        states = [(event, db.ensure_calendar_state(event.key, event.title, event.country,
+                                                   event.impact, event.event_time, event.forecast, event.previous))
+                  for event in group]
+        if all(state.pre_sent for _, state in states):
+            continue
+        for user in users:
+            try:
+                bot.send_message(user.chat_id, calendar_pre_text(group, user.language, user.tz_name),
+                                 parse_mode="HTML", disable_web_page_preview=True)
+            except Exception:
+                logger.exception("calendar pre-brief failed chat_id=%s", user.chat_id)
+        for _, state in states:
+            db.mark_calendar_stage(state.event_key, "pre_sent")
+
+    for group in _group_calendar_events(release_due):
+        states = [(event, db.ensure_calendar_state(event.key, event.title, event.country,
+                                                   event.impact, event.event_time, event.forecast, event.previous))
+                  for event in group]
+        if all(state.release_sent for _, state in states):
+            continue
+        assets = sorted({key for event in group for key in event.assets})[:4]
+        prices = {key: price for key in assets if (price := live_price_for(key)) is not None}
+        for user in users:
+            try:
+                bot.send_message(user.chat_id, calendar_release_text(group, prices, user.language),
+                                 parse_mode="HTML", disable_web_page_preview=True)
+            except Exception:
+                logger.exception("calendar release failed chat_id=%s", user.chat_id)
+        for _, state in states:
+            db.mark_calendar_stage(state.event_key, "release_sent", json.dumps(prices))
+
+    for group in _group_calendar_events(followup_due):
+        states = [(event, db.ensure_calendar_state(event.key, event.title, event.country,
+                                                   event.impact, event.event_time, event.forecast, event.previous))
+                  for event in group]
+        if all(state.followup_sent for _, state in states):
+            continue
+        # Skip ancient backlog (bot was down for hours): measuring a reaction
+        # days late would be fiction presented as analysis.
+        age_hours = (now_utc - group[0].event_time).total_seconds() / 3600
+        if age_hours > 3:
+            for _, state in states:
+                db.mark_calendar_stage(state.event_key, "followup_sent")
+            continue
+        try:
+            refs = json.loads(states[0][1].ref_prices or "{}")
+        except (ValueError, TypeError):
+            refs = {}
+        if not refs:
+            continue  # release snapshot missing; wait for nothing, mark nothing
+        moves: list[tuple[str, float, float]] = []
+        for key, ref in refs.items():
+            current = live_price_for(key)
+            if current:
+                moves.append((key, float(ref), current))
+        if not moves:
+            continue
+        # Direction comes from the short-expiry engine on the most-moved asset.
+        main_key = max(moves, key=lambda row: abs((row[2] - row[1]) / row[1] if row[1] else 0.0))[0]
+        main_asset = ASSETS.get(main_key)
+        plan_direction = None
+        try:
+            verdict = binary_verdict_for(main_asset) if main_asset else None
+        except DataUnavailable:
+            verdict = None
+        if verdict is not None and verdict.verdict == "CALL":
+            plan_direction = "BUY"
+        elif verdict is not None and verdict.verdict == "PUT":
+            plan_direction = "SELL"
+
+        def _verdict_line(lang: str) -> str:
+            if verdict is None or main_asset is None:
+                return "⚖️ Live verdict unavailable — watch only." if lang == "en" else "⚖️ تعذر حساب قرار لحظي — راقب فقط."
+            if verdict.verdict == "WAIT":
+                return f"⚖️ Verdict on {main_key}: ⏸️ WAIT — no entry." if lang == "en" else f"⚖️ القرار على {main_key}: ⏸️ انتظار — لا دخول الآن."
+            if lang == "en":
+                arrow = "🟢 BUY" if verdict.verdict == "CALL" else "🔴 SELL"
+                return f"⚖️ Verdict on {main_key}: {arrow} ({verdict.confidence} confidence)."
+            arrow = "🟢 شراء" if verdict.verdict == "CALL" else "🔴 بيع"
+            return f"⚖️ القرار على {main_key}: {arrow} (ثقة {verdict.confidence})."
+
+        for user in users:
+            lang = user.language
+            line = _verdict_line(lang)
+            plan = event_trade_plan(main_asset, plan_direction, user.capital or 1000.0,
+                                    user.risk_percent or 1.0, lang) if (main_asset and plan_direction) else None
+            try:
+                bot.send_message(user.chat_id, calendar_followup_text(group, moves, line, plan, lang),
+                                 parse_mode="HTML", disable_web_page_preview=True)
+                if main_asset and plan_direction:
+                    db.journal_add("event", main_asset.key, plan_direction, moves[0][2] if moves else 0,
+                                   60, chat_id=user.chat_id, note=f"calendar:{group[0].key[:8]}")
+            except Exception:
+                logger.exception("calendar followup failed chat_id=%s", user.chat_id)
+        for _, state in states:
+            db.mark_calendar_stage(state.event_key, "followup_sent")
+
+
+def news_impact_text(asset: Asset, headline: str, move_pct: float, lang: str) -> str:
+    name = asset.name_ar if lang == "ar" else asset.name_en
+    if lang == "ar":
+        direction = "صاعد 📈" if move_pct > 0 else "هابط 📉"
+        return (
+            f"📡 <b>تأثير الخبر على {html.escape(name)}</b>\n"
+            f"📰 {html.escape(headline[:180])}\n"
+            f"📊 الحركة منذ الخبر: <b>{move_pct:+.2f}%</b> — الاتجاه قصير المدى {direction}\n"
+            f"💡 هذه قراءة لرد الفعل الفعلي؛ إن أردت خطة دخول اطلب /binary {asset.key}."
+        )
+    direction = "up 📈" if move_pct > 0 else "down 📉"
+    return (
+        f"📡 <b>News impact on {html.escape(name)}</b>\n"
+        f"📰 {html.escape(headline[:180])}\n"
+        f"📊 Move since the news: <b>{move_pct:+.2f}%</b> — short-term direction {direction}\n"
+        f"💡 This reads the actual reaction; ask /binary {asset.key} for an entry plan."
+    )
+
+
+def resolve_journal_and_notify() -> None:
+    """Resolve due journal rows; loudly report big news impacts only."""
+    try:
+        due = db.journal_due(limit=50)
+    except Exception:
+        logger.exception("journal fetch failed")
+        return
+    for entry in due:
+        asset = ASSETS.get(entry.asset_key)
+        exit_price = live_price_for(entry.asset_key) if asset else None
+        if exit_price is None:
+            continue  # keep pending; a missing quote must not forge an outcome
+        from marketobserver.learning import classify as classify_outcome
+        outcome = classify_outcome(entry.ref_price, exit_price, entry.verdict)
+        if entry.kind == "news" and entry.chat_id and asset:
+            move_pct = (exit_price - entry.ref_price) / entry.ref_price * 100 if entry.ref_price else 0.0
+            threshold = NEWS_IMPACT_THRESHOLD.get(asset.asset_class, 0.005) * 100
+            if abs(move_pct) >= threshold:
+                user = db.get_user(entry.chat_id)
+                lang = user.language if user else "ar"
+                try:
+                    bot.send_message(entry.chat_id, news_impact_text(asset, entry.note or "", move_pct, lang),
+                                     parse_mode="HTML", disable_web_page_preview=True)
+                except Exception:
+                    logger.exception("news impact delivery failed chat_id=%s", entry.chat_id)
+        db.journal_resolve(entry.id, outcome, exit_price)
+
+
 def alert_loop():
-    global last_signal_scan_at, last_news_scan_at
+    global last_signal_scan_at, last_news_scan_at, last_calendar_scan_at, last_journal_scan_at
     while True:
         try:
             active = db.active_alerts()
@@ -1505,6 +2181,14 @@ def alert_loop():
                 asset = ASSETS.get(asset_key)
                 if not asset:
                     continue
+                # Alerts trigger on the live quote (seconds old), not on the
+                # last closed candle; the candle close is only a fallback so a
+                # brief quote outage never freezes every pending alert.
+                try:
+                    prices[asset_key] = live.get_quote(asset).price
+                    continue
+                except QuoteUnavailable:
+                    logger.info("live quote unavailable for %s; falling back to candle close", asset_key)
                 try:
                     candles = market.get_candles(asset, settings.default_interval, 100)
                     prices[asset_key] = candles[-1].close
@@ -1536,7 +2220,7 @@ def alert_loop():
                 if rows:
                     current_utc = datetime.now(timezone.utc)
                     for user in db.signal_users():
-                        if user.signal_cooldown_until and user.signal_cooldown_until > current_utc:
+                        if cooldown_active(user.signal_cooldown_until, current_utc):
                             continue
                         try:
                             bot.send_message(user.chat_id, signal_text(rows, user.language, user.tz_name))
@@ -1545,9 +2229,11 @@ def alert_loop():
                             logger.exception("signal delivery failed chat_id=%s", user.chat_id)
                 last_signal_scan_at = now
             if now - last_news_scan_at >= settings.news_scan_seconds:
+                # One top story per user per cycle: high impact + fresh + never
+                # sent to THIS user. Seen-tracking is per chat, so an idle user
+                # misses nothing that another user received.
                 users = db.news_users()
                 snapshots = {}
-                pending_fingerprints = set()
                 for user in users:
                     scope = (user.news_assets or "ALL").strip()
                     requested = list(ASSETS.keys())[:12] if scope.upper() == "ALL" else [key.strip() for key in scope.split(",") if key.strip()]
@@ -1560,30 +2246,50 @@ def alert_loop():
                                 logger.exception("news scan failed asset=%s", asset_key)
                 current_news_time = datetime.now(timezone.utc)
                 for user in users:
-                    if user.news_cooldown_until and user.news_cooldown_until > current_news_time:
+                    if cooldown_active(user.news_cooldown_until, current_news_time):
                         continue
                     scope = (user.news_assets or "ALL").strip()
                     requested = list(ASSETS.keys())[:12] if scope.upper() == "ALL" else [key.strip() for key in scope.split(",") if key.strip()]
+                    candidates: list[tuple] = []
                     for asset_key in requested:
                         snapshot = snapshots.get(asset_key)
                         if not snapshot or not snapshot.items:
                             continue
-                        fresh = []
                         for item in snapshot.items:
-                            fingerprint = headline_fingerprint(item)
-                            if not db.news_was_seen(fingerprint):
-                                fresh.append(item)
-                                pending_fingerprints.add(fingerprint)
-                        if fresh:
-                            for item in fresh[:2]:
-                                try:
-                                    bot.send_message(user.chat_id, news_alert_text(snapshot.asset, [item], user.language, user.tz_name), parse_mode="HTML", disable_web_page_preview=True)
-                                    db.set_news_cooldown(user.chat_id, datetime.now(timezone.utc) + timedelta(minutes=30))
-                                except Exception:
-                                    logger.exception("news delivery failed chat_id=%s", user.chat_id)
-                for fingerprint in pending_fingerprints:
-                    db.mark_news_seen(fingerprint)
+                            if headline_importance_level(item) != "high":
+                                continue
+                            if not is_fresh(item, 6.0, current_news_time):
+                                continue
+                            if db.news_was_seen(headline_fingerprint(item), chat_id=user.chat_id):
+                                continue
+                            age = headline_age_hours(item, current_news_time)
+                            candidates.append((age if age is not None else 1e9, snapshot.asset, item))
+                    if not candidates:
+                        continue
+                    candidates.sort(key=lambda row: row[0])
+                    _, top_asset, top_item = candidates[0]
+                    try:
+                        bot.send_message(user.chat_id, news_alert_text(top_asset, [top_item], user.language, user.tz_name), parse_mode="HTML", disable_web_page_preview=True)
+                        db.mark_news_seen(headline_fingerprint(top_item), chat_id=user.chat_id)
+                        db.set_news_cooldown(user.chat_id, current_news_time + timedelta(minutes=30))
+                        # Watch the impact: directional news is journaled so the
+                        # resolver can report the real market reaction later.
+                        if top_item.sentiment in {"positive", "negative"}:
+                            ref = live_price_for(top_asset.key)
+                            if ref:
+                                db.journal_add("news", top_asset.key,
+                                               "CALL" if top_item.sentiment == "positive" else "PUT",
+                                               ref, 45, chat_id=user.chat_id,
+                                               note=_headline_parts(top_item.title)[0][:180])
+                    except Exception:
+                        logger.exception("news delivery failed chat_id=%s", user.chat_id)
                 last_news_scan_at = now
+            if now - last_calendar_scan_at >= settings.calendar_scan_seconds:
+                scan_calendar(datetime.now(timezone.utc))
+                last_calendar_scan_at = now
+            if now - last_journal_scan_at >= 120:
+                resolve_journal_and_notify()
+                last_journal_scan_at = now
         except Exception:
             logger.exception("alert loop failure")
         time.sleep(settings.alert_poll_seconds)
@@ -1647,6 +2353,114 @@ def decision_endpoint(asset_key: str):
     payload["summary"] = render_decision_brief(decision, "ar" if lang == "ar" else "en")
     payload["report"] = render_decision(decision, lang, verbose=verbose)
     return jsonify(payload)
+
+
+@app.get("/price/<asset_key>")
+def price_endpoint(asset_key: str):
+    """Instant live quote as JSON: price, venue source and quote age."""
+    asset = resolve_asset(asset_key)
+    if asset is None:
+        return jsonify({"error": "unknown asset"}), 404
+    try:
+        quote = live.get_quote(asset)
+    except QuoteUnavailable:
+        return jsonify({"error": "no live quote for this asset", "asset": asset.key}), 503
+    return jsonify({
+        "asset": asset.key,
+        "name_ar": asset.name_ar,
+        "name_en": asset.name_en,
+        "price": quote.price,
+        "quote": asset.quote,
+        "source": quote.source,
+        "age_seconds": quote.age_seconds,
+        "as_of": quote.as_of.isoformat(),
+    })
+
+
+@app.get("/assets")
+def assets_endpoint():
+    """Full asset catalog grouped by class, from the same source the bot uses."""
+    wanted = (request.args.get("class") or "").strip().lower()
+    classes = [wanted] if wanted in ASSET_CLASS_ORDER else list(ASSET_CLASS_ORDER)
+    return jsonify({
+        "count": sum(len(assets_by_class(cls)) for cls in classes),
+        "classes": {
+            cls: [{"key": asset.key, "name_ar": asset.name_ar, "name_en": asset.name_en,
+                   "quote": asset.quote, "decimals": asset.price_decimals}
+                  for asset in assets_by_class(cls)]
+            for cls in classes
+        },
+    })
+
+
+@app.get("/binary/<asset_key>")
+def binary_endpoint(asset_key: str):
+    """Short-expiry CALL / PUT / WAIT verdict as JSON plus its rendered block.
+
+    Query params: lang (ar|en), refresh=1 to bypass the short cache.
+    """
+    asset = resolve_asset(asset_key)
+    if asset is None:
+        return jsonify({"error": "unknown asset"}), 404
+    lang = request.args.get("lang", "ar")
+    if lang not in ("ar", "en"):
+        return jsonify({"error": "lang must be ar or en"}), 400
+    try:
+        verdict = binary_verdict_for(asset, force=request.args.get("refresh") == "1")
+    except DataUnavailable:
+        return jsonify({"error": "no reliable 5m/15m data for this asset", "asset": asset.key}), 503
+    payload = binary_to_dict(verdict)
+    payload["report"] = render_binary(verdict, lang)
+    return jsonify(payload)
+
+
+@app.get("/calendar")
+def calendar_endpoint():
+    """Upcoming high/medium-impact events. Query: hours (default 24)."""
+    try:
+        hours = max(1, min(168, int(request.args.get("hours", "24"))))
+    except ValueError:
+        return jsonify({"error": "hours must be an integer"}), 400
+    try:
+        events = calendar_feed.upcoming(hours, ("High", "Medium"))
+    except Exception:
+        return jsonify({"error": "calendar unavailable"}), 503
+    return jsonify({
+        "count": len(events),
+        "events": [{
+            "title": event.title, "country": event.country, "impact": event.impact,
+            "time": event.event_time.isoformat(), "forecast": event.forecast,
+            "previous": event.previous, "assets": list(event.assets),
+        } for event in events],
+    })
+
+
+@app.get("/stats")
+def stats_endpoint():
+    """Decision-journal accuracy. Query: days (default 30), kind, lang."""
+    try:
+        days = max(1, min(365, int(request.args.get("days", "30"))))
+    except ValueError:
+        return jsonify({"error": "days must be an integer"}), 400
+    kind = request.args.get("kind") or None
+    if kind and kind not in {"binary", "event", "news"}:
+        return jsonify({"error": "kind must be binary, event or news"}), 400
+    lang = request.args.get("lang", "ar")
+    if lang not in {"ar", "en"}:
+        return jsonify({"error": "lang must be ar or en"}), 400
+    summary = db.journal_stats(days=days, kind=kind)
+    decided = summary["wins"] + summary["losses"]
+    return jsonify({
+        "days": days, "kind": kind or "all",
+        "trades": summary["trades"], "wins": summary["wins"],
+        "losses": summary["losses"], "flats": summary["flats"],
+        "win_rate": round(summary["wins"] / decided, 3) if decided else 0.0,
+        "breakdown": [
+            {"asset": asset, "verdict": verdict, "trades": count, "wins": wins}
+            for asset, verdict, count, wins in db.journal_breakdown(days=days, kind=kind)
+        ],
+        "report": stats_report(db, lang, days),
+    })
 
 
 def authorized() -> bool:
@@ -1748,6 +2562,13 @@ def main():
     try:
         bot.set_my_commands([
             types.BotCommand("start", "البداية والأزرار / start and buttons"),
+            types.BotCommand("price", "سعر لحظي / live price"),
+            types.BotCommand("assets", "كتالوج الأصول / asset catalog"),
+            types.BotCommand("binary", "تداول ثنائي CALL/PUT / binary verdict"),
+            types.BotCommand("calendar", "التقويم الاقتصادي / economic calendar"),
+            types.BotCommand("stats", "دقة البوت / bot accuracy"),
+            types.BotCommand("capital", "رأس المال والمخاطرة / capital and risk"),
+            types.BotCommand("decision", "قرار صارم شراء/بيع/انتظار / strict verdict"),
             types.BotCommand("smc", "تحليل سيولة ذكية 4H/1H/15m / smart-money report"),
             types.BotCommand("analyze", "تحليل المؤشرات / indicator analysis"),
             types.BotCommand("chart", "شارت من بيانات حقيقية / real-data chart"),

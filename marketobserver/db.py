@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, update, delete, Index, inspect, text, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -8,6 +8,27 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def coerce_aware(value: datetime | None) -> datetime | None:
+    """Return an aware UTC datetime for cooldown comparisons.
+
+    SQLite returns naive datetimes for DateTime(timezone=True) columns while
+    PostgreSQL returns aware ones; comparing a naive value against
+    ``datetime.now(timezone.utc)`` raises TypeError and used to kill the whole
+    news scanner after the first cooldown was ever stored. All stored times
+    are UTC, so attaching UTC to a naive value is exact, not a guess.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def cooldown_active(until: datetime | None, now: datetime) -> bool:
+    moment = coerce_aware(until)
+    return bool(moment and moment > now)
 
 
 class Base(DeclarativeBase):
@@ -30,6 +51,9 @@ class User(Base):
     news_assets: Mapped[str] = mapped_column(String(500), default="ALL")
     news_preference_set: Mapped[bool] = mapped_column(Boolean, default=False)
     news_cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    calendar_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    capital: Mapped[float] = mapped_column(Float, default=1000.0)
+    risk_percent: Mapped[float] = mapped_column(Float, default=1.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -51,6 +75,66 @@ class NewsSeen(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     fingerprint: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class NewsSeenUser(Base):
+    """Per-user delivery log. The legacy global table suppressed a headline
+    for *everyone* once a single user received it, so idle users silently
+    missed news. New deliveries are recorded here per chat."""
+    __tablename__ = "news_seen_user"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(Integer, index=True)
+    fingerprint: Mapped[str] = mapped_column(String(128), index=True)
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CalendarState(Base):
+    """Exactly-once tracking for economic-event notifications.
+
+    One row per event; the three stages (pre-brief, release, follow-up) flip
+    independently so a restart can never resend a stage or skip the next one.
+    ``ref_prices`` is a JSON object {asset_key: price} snapshotted at release
+    so the follow-up measures the market's real reaction.
+    """
+    __tablename__ = "calendar_state"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    country: Mapped[str] = mapped_column(String(10))
+    impact: Mapped[str] = mapped_column(String(10))
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    forecast: Mapped[str] = mapped_column(String(64), default="")
+    previous: Mapped[str] = mapped_column(String(64), default="")
+    pre_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    release_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    followup_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    ref_prices: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class Journal(Base):
+    """Decision journal: every auto-tracked verdict with its measured outcome.
+
+    The learning loop is deliberately boring and honest — record the call and
+    the reference price, re-check the price after the horizon, store win/loss.
+    Statistics and confidence calibration are computed from these rows only;
+    nothing is ever edited or deleted, so accuracy cannot be gamed.
+    """
+    __tablename__ = "journal"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)  # binary | event | news
+    chat_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    asset_key: Mapped[str] = mapped_column(String(30), index=True)
+    verdict: Mapped[str] = mapped_column(String(10))  # CALL | PUT | BUY | SELL
+    ref_price: Mapped[float] = mapped_column(Float)
+    horizon_minutes: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolve_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[str] = mapped_column(String(10), default="pending", index=True)  # pending | win | loss | flat
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    note: Mapped[str] = mapped_column(Text, default="")
 
 
 class PaperAccount(Base):
@@ -81,6 +165,7 @@ class Trade(Base):
 
 
 Index("ix_alerts_active_asset", Alert.status, Alert.asset_key)
+Index("ix_news_seen_user_chat_fp", NewsSeenUser.chat_id, NewsSeenUser.fingerprint, unique=True)
 
 
 class Database:
@@ -112,6 +197,12 @@ class Database:
             missing.append("ALTER TABLE users ADD COLUMN news_assets VARCHAR(500) DEFAULT 'ALL'")
         if "news_preference_set" not in columns:
             missing.append("ALTER TABLE users ADD COLUMN news_preference_set BOOLEAN DEFAULT FALSE")
+        if "calendar_enabled" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN calendar_enabled BOOLEAN DEFAULT TRUE")
+        if "capital" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN capital DOUBLE PRECISION DEFAULT 1000.0")
+        if "risk_percent" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN risk_percent DOUBLE PRECISION DEFAULT 1.0")
         if missing:
             with self.engine.begin() as connection:
                 for statement in missing:
@@ -122,7 +213,9 @@ class Database:
             connection.execute(text("UPDATE users SET news_preference_set = FALSE WHERE news_preference_set IS NULL"))
             connection.execute(text("UPDATE users SET news_enabled = TRUE WHERE news_preference_set = FALSE AND news_enabled IS NULL"))
             connection.execute(text("UPDATE users SET news_assets = 'ALL' WHERE news_preference_set = FALSE AND (news_assets IS NULL OR news_assets = '')"))
-
+            connection.execute(text("UPDATE users SET calendar_enabled = TRUE WHERE calendar_enabled IS NULL"))
+            connection.execute(text("UPDATE users SET capital = 1000.0 WHERE capital IS NULL OR capital <= 0"))
+            connection.execute(text("UPDATE users SET risk_percent = 1.0 WHERE risk_percent IS NULL OR risk_percent <= 0"))
 
     @contextmanager
     def session(self):
@@ -169,6 +262,18 @@ class Database:
         with self.session() as s:
             s.execute(update(User).where(User.chat_id == chat_id).values(tz_name=tz_name, updated_at=utcnow()))
 
+    def set_capital(self, chat_id: int, capital: float) -> None:
+        with self.session() as s:
+            s.execute(update(User).where(User.chat_id == chat_id).values(capital=capital, updated_at=utcnow()))
+
+    def set_risk_percent(self, chat_id: int, risk_percent: float) -> None:
+        with self.session() as s:
+            s.execute(update(User).where(User.chat_id == chat_id).values(risk_percent=risk_percent, updated_at=utcnow()))
+
+    def set_calendar_enabled(self, chat_id: int, enabled: bool) -> None:
+        with self.session() as s:
+            s.execute(update(User).where(User.chat_id == chat_id).values(calendar_enabled=enabled, updated_at=utcnow()))
+
     def set_signals_enabled(self, chat_id: int, enabled: bool) -> None:
         with self.session() as s:
             s.execute(update(User).where(User.chat_id == chat_id).values(signals_enabled=enabled, updated_at=utcnow()))
@@ -207,18 +312,136 @@ class Database:
         with self.session() as s:
             return list(s.scalars(select(User).where(User.is_active.is_(True), or_(User.news_preference_set.is_(False), User.news_preference_set.is_(None), User.news_enabled.is_(True)))).all())
 
+    def calendar_users(self) -> list[User]:
+        with self.session() as s:
+            return list(s.scalars(select(User).where(User.is_active.is_(True), or_(User.calendar_enabled.is_(True), User.calendar_enabled.is_(None)))).all())
+
     def set_news_cooldown(self, chat_id: int, until: datetime) -> None:
         with self.session() as s:
             s.execute(update(User).where(User.chat_id == chat_id).values(news_cooldown_until=until, updated_at=utcnow()))
 
-    def news_was_seen(self, fingerprint: str) -> bool:
+    def news_was_seen(self, fingerprint: str, chat_id: int | None = None) -> bool:
+        """Legacy global check, plus the per-user log when a chat is given."""
         with self.session() as s:
+            if chat_id is not None:
+                row = s.scalar(select(NewsSeenUser.id).where(
+                    NewsSeenUser.chat_id == chat_id, NewsSeenUser.fingerprint == fingerprint))
+                if row is not None:
+                    return True
             return s.scalar(select(NewsSeen.id).where(NewsSeen.fingerprint == fingerprint)) is not None
 
-    def mark_news_seen(self, fingerprint: str) -> None:
+    def mark_news_seen(self, fingerprint: str, chat_id: int | None = None) -> None:
         with self.session() as s:
+            if chat_id is not None:
+                exists = s.scalar(select(NewsSeenUser.id).where(
+                    NewsSeenUser.chat_id == chat_id, NewsSeenUser.fingerprint == fingerprint))
+                if exists is None:
+                    s.add(NewsSeenUser(chat_id=chat_id, fingerprint=fingerprint))
+                return
             if s.scalar(select(NewsSeen.id).where(NewsSeen.fingerprint == fingerprint)) is None:
                 s.add(NewsSeen(fingerprint=fingerprint))
+
+    # ---------------- economic calendar state ----------------
+
+    def get_calendar_state(self, event_key: str) -> CalendarState | None:
+        with self.session() as s:
+            return s.scalar(select(CalendarState).where(CalendarState.event_key == event_key))
+
+    def ensure_calendar_state(self, event_key: str, title: str, country: str, impact: str,
+                              event_time: datetime, forecast: str = "", previous: str = "") -> CalendarState:
+        with self.session() as s:
+            state = s.scalar(select(CalendarState).where(CalendarState.event_key == event_key))
+            if state is None:
+                state = CalendarState(event_key=event_key, title=title, country=country,
+                                      impact=impact, event_time=event_time,
+                                      forecast=forecast or "", previous=previous or "")
+                s.add(state)
+                s.flush()
+            return state
+
+    def mark_calendar_stage(self, event_key: str, stage: str, ref_prices: str | None = None) -> None:
+        if stage not in {"pre_sent", "release_sent", "followup_sent"}:
+            raise ValueError(f"Unknown calendar stage: {stage}")
+        with self.session() as s:
+            values: dict = {stage: True, "updated_at": utcnow()}
+            if ref_prices is not None:
+                values["ref_prices"] = ref_prices
+            s.execute(update(CalendarState).where(CalendarState.event_key == event_key).values(**values))
+
+    def prune_calendar_state(self, older_than_days: int = 14) -> int:
+        cutoff = utcnow() - timedelta(days=older_than_days)
+        with self.session() as s:
+            result = s.execute(delete(CalendarState).where(CalendarState.event_time < cutoff))
+            return result.rowcount or 0
+
+    # ---------------- decision journal ----------------
+
+    def journal_add(self, kind: str, asset_key: str, verdict: str, ref_price: float,
+                    horizon_minutes: int, chat_id: int | None = None, note: str = "") -> Journal:
+        now = utcnow()
+        with self.session() as s:
+            entry = Journal(kind=kind, chat_id=chat_id, asset_key=asset_key, verdict=verdict,
+                            ref_price=ref_price, horizon_minutes=horizon_minutes,
+                            created_at=now, resolve_at=now + timedelta(minutes=horizon_minutes),
+                            outcome="pending", note=note or "")
+            s.add(entry)
+            s.flush()
+            return entry
+
+    def journal_due(self, limit: int = 50) -> list[Journal]:
+        with self.session() as s:
+            return list(s.scalars(select(Journal).where(
+                Journal.outcome == "pending", Journal.resolve_at <= utcnow(),
+            ).order_by(Journal.resolve_at.asc()).limit(limit)).all())
+
+    def journal_resolve(self, entry_id: int, outcome: str, exit_price: float | None) -> bool:
+        if outcome not in {"win", "loss", "flat"}:
+            raise ValueError(f"Unknown outcome: {outcome}")
+        with self.session() as s:
+            result = s.execute(update(Journal).where(
+                Journal.id == entry_id, Journal.outcome == "pending",
+            ).values(outcome=outcome, exit_price=exit_price, resolved_at=utcnow()))
+            return result.rowcount == 1
+
+    def journal_stats(self, days: int = 30, kind: str | None = None,
+                      asset_key: str | None = None, verdict: str | None = None) -> dict[str, int]:
+        cutoff = utcnow() - timedelta(days=days)
+        with self.session() as s:
+            query = select(Journal.outcome).where(
+                Journal.resolved_at.is_not(None), Journal.resolved_at >= cutoff,
+                Journal.outcome.in_(["win", "loss", "flat"]),
+            )
+            if kind:
+                query = query.where(Journal.kind == kind)
+            if asset_key:
+                query = query.where(Journal.asset_key == asset_key)
+            if verdict:
+                query = query.where(Journal.verdict == verdict)
+            rows = list(s.scalars(query).all())
+        wins = sum(1 for outcome in rows if outcome == "win")
+        losses = sum(1 for outcome in rows if outcome == "loss")
+        flats = sum(1 for outcome in rows if outcome == "flat")
+        return {"trades": len(rows), "wins": wins, "losses": losses, "flats": flats}
+
+    def journal_breakdown(self, days: int = 30, kind: str | None = None) -> list[tuple[str, str, int, int]]:
+        """(asset_key, verdict, trades, wins) for the stats report."""
+        from collections import Counter
+        cutoff = utcnow() - timedelta(days=days)
+        with self.session() as s:
+            query = select(Journal.asset_key, Journal.verdict, Journal.outcome).where(
+                Journal.resolved_at.is_not(None), Journal.resolved_at >= cutoff,
+                Journal.outcome.in_(["win", "loss", "flat"]),
+            )
+            if kind:
+                query = query.where(Journal.kind == kind)
+            rows = list(s.execute(query).all())
+        trades: Counter[tuple[str, str]] = Counter()
+        wins: Counter[tuple[str, str]] = Counter()
+        for asset_key, verdict, outcome in rows:
+            trades[(asset_key, verdict)] += 1
+            if outcome == "win":
+                wins[(asset_key, verdict)] += 1
+        return [(asset, verdict, count, wins[(asset, verdict)]) for (asset, verdict), count in trades.most_common(12)]
 
     def add_alert(self, chat_id: int, asset_key: str, target_price: float, condition: str) -> Alert:
         with self.session() as s:
@@ -292,4 +515,6 @@ class Database:
                 "active_users": len(s.scalars(select(User.id).where(User.is_active.is_(True))).all()),
                 "active_alerts": len(s.scalars(select(Alert.id).where(Alert.status == "active")).all()),
                 "trades": len(s.scalars(select(Trade.id)).all()),
+                "journal_pending": len(s.scalars(select(Journal.id).where(Journal.outcome == "pending")).all()),
+                "journal_resolved": len(s.scalars(select(Journal.id).where(Journal.outcome != "pending")).all()),
             }
