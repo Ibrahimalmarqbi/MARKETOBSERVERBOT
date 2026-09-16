@@ -27,6 +27,35 @@ class DataUnavailable(RuntimeError):
     pass
 
 
+def load_candle_csv(path: str) -> list[Candle]:
+    """Read closed candles from a local CSV dump. Header must be
+    ``ts,open,high,low,close,volume[,buy_volume]`` with ``ts`` in milliseconds —
+    the same layout ``tools/smc_report.py --csv-prefix`` and the offline replays
+    in this repository use. Used for audits and tests so a report can always be
+    reproduced from the exact bars it was computed on. Rows are sorted by
+    timestamp, because exchange endpoints return their klines newest-first and a
+    reversed series would silently invert the whole analysis.
+    """
+    from datetime import datetime as _datetime
+
+    candles: list[Candle] = []
+    with open(path, encoding="utf-8") as handle:
+        header = handle.readline().strip().split(",")
+        for line in handle:
+            values = line.strip().split(",")
+            if len(values) < len(header) or not values[0].isdigit():
+                continue
+            row = dict(zip(header, values))
+            buy = (row.get("buy_volume") or "").strip()
+            candles.append(Candle(
+                timestamp=_datetime.fromtimestamp(int(row["ts"]) / 1000, tz=timezone.utc),
+                open=float(row["open"]), high=float(row["high"]), low=float(row["low"]),
+                close=float(row["close"]), volume=float(row["volume"]),
+                buy_volume=float(buy) if buy else None,
+            ))
+    return sorted(candles, key=lambda candle: candle.timestamp)
+
+
 @dataclass(frozen=True)
 class Candle:
     timestamp: datetime

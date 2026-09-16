@@ -22,33 +22,22 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from marketobserver.assets import resolve_asset  # noqa: E402
-from marketobserver.market_data import Candle  # noqa: E402
+from marketobserver.market_data import load_candle_csv  # noqa: E402
 from marketobserver.smc import build_report  # noqa: E402
 from marketobserver.smc_text import LANGS, render  # noqa: E402
 
 TIMEFRAMES = ("4h", "1h", "15m")
 
 
-def load_csv(prefix: str, timeframe: str) -> list[Candle]:
-    path = Path(f"{prefix}_{timeframe}.csv")
+def load_csv(prefix: str, timeframe: str) -> list:
+    """Read one timeframe from ``<prefix>_<tf>.csv`` (the shared loader sorts the
+    rows, so a newest-first export from an exchange endpoint is handled)."""
+    from pathlib import Path as _Path
+
+    path = _Path(f"{prefix}_{timeframe}.csv")
     if not path.exists():
         raise SystemExit(f"missing candle file: {path}")
-    candles: list[Candle] = []
-    with path.open() as handle:
-        header = handle.readline().strip().split(",")
-        for line in handle:
-            values = line.strip().split(",")
-            if len(values) < len(header) or not values[0].isdigit():
-                continue
-            row = dict(zip(header, values))
-            buy = (row.get("buy_volume") or "").strip()
-            candles.append(Candle(
-                timestamp=datetime.fromtimestamp(int(row["ts"]) / 1000, tz=timezone.utc),
-                open=float(row["open"]), high=float(row["high"]), low=float(row["low"]), close=float(row["close"]),
-                volume=float(row["volume"]),
-                buy_volume=float(buy) if buy else None,
-            ))
-    return candles
+    return load_candle_csv(str(path))
 
 
 def main() -> int:

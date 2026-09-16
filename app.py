@@ -33,6 +33,12 @@ from marketobserver.risk import calculate_position_size
 from marketobserver.llm import GroundedLLM
 from marketobserver.smc import build_report as build_smc_report
 from marketobserver.smc_text import LANGS as SMC_LANGS, render as render_smc, render_brief as render_smc_brief, to_dict as smc_to_dict
+from marketobserver.decision import (
+    decide as build_strict_decision,
+    render as render_decision,
+    render_brief as render_decision_brief,
+    to_dict as decision_to_dict,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("marketobserver")
@@ -55,13 +61,13 @@ app = Flask(__name__)
 
 
 AR = {
-    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، هل أدخل البيتكوين؟ أو احسب مخاطرة رأس المال 10000 بنسبة 1% دخول 4715 وقف 4690. يمكنك أيضًا استخدام /analyze و /smc (تحليل سيولة ذكية بأزرار) و /alert و /risk و /paperbuy.",
+    "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، هل أدخل البيتكوين؟ أو احسب مخاطرة رأس المال 10000 بنسبة 1% دخول 4715 وقف 4690. يمكنك أيضًا استخدام /analyze و /smc (تحليل سيولة ذكية بأزرار) و /decision (قرار صارم: شراء/بيع/انتظار) و /alert و /risk و /paperbuy.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
-    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /analyze /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
 
 EN = {
-    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /analyze /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
 }
 
 
@@ -1023,6 +1029,157 @@ def smc_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id, "تعذر تنفيذ الزر" if lang == "ar" else "Button failed", show_alert=True)
 
 
+# --------------------------------------------------------------------------- #
+# Strict decision engine (/decision): BUY / SELL / WAIT with a hard gate chain.
+# The engine lives in marketobserver/decision.py; this layer only fetches the
+# three timeframes, renders the verdict and exposes it over HTTP.
+# --------------------------------------------------------------------------- #
+DECISION_COMMANDS = ("decision", "verdict", "call")
+DECISION_TTL_SECONDS = 40
+decision_cache: dict[str, tuple[float, object]] = {}
+
+
+def decision_lang_for(message: types.Message, chat_id: int | None = None) -> str:
+    """Reuse the language the user picked for /smc, then fall back to detection."""
+    if chat_id is None and message is not None:
+        chat_id = message.chat.id
+    stored = (smc_prefs.get(chat_id or 0) or {}).get("lang")
+    if stored in SMC_LANGS:
+        return stored
+    return user_language(message) if message is not None else "en"
+
+
+def decision_candles(asset: Asset, force: bool = False):
+    """Fetch 4H, 1H and 15m once and run the strict gate chain on closed bars."""
+    cached = decision_cache.get(asset.key)
+    if cached and not force and time.time() - cached[0] < DECISION_TTL_SECONDS:
+        return cached[1]
+    candles_by_timeframe: dict[str, list] = {}
+    for timeframe in SMC_TIMEFRAMES:
+        try:
+            candles_by_timeframe[timeframe] = market.get_candles(asset, timeframe, 200)
+        except DataUnavailable:
+            continue
+    if "4h" not in candles_by_timeframe:
+        raise DataUnavailable(f"the 4H trend gate needs 4H candles for {asset.key}")
+    decision = build_strict_decision(asset.key, asset.name_ar, asset.name_en, asset.quote,
+                                     asset.price_decimals, candles_by_timeframe,
+                                     market.last_source(asset.key) or "unknown")
+    payload = (decision, candles_by_timeframe)
+    decision_cache[asset.key] = (time.time(), payload)
+    return payload
+
+
+def decision_keyboard(asset_key: str, lang: str, verbose: bool = False) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("🔄 إعادة الحساب" if lang == "ar" else "🔄 Recompute",
+                                   callback_data=f"dec:run:{asset_key}:{lang}:{1 if verbose else 0}:1"),
+        types.InlineKeyboardButton("🧾 البوابات" if lang == "ar" else "🧾 Gate chain",
+                                   callback_data=f"dec:run:{asset_key}:{lang}:{0 if verbose else 1}:1"),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton("🇸🇦 عربي", callback_data=f"dec:run:{asset_key}:ar:0:0"),
+        types.InlineKeyboardButton("🇬🇧 English", callback_data=f"dec:run:{asset_key}:en:0:0"),
+        types.InlineKeyboardButton("🌐 AR + EN", callback_data=f"dec:run:{asset_key}:both:0:0"),
+    )
+    quick = [key for key in SMC_PRIMARY_ASSETS if key != asset_key][:4]
+    keyboard.add(*[types.InlineKeyboardButton(SMC_BUTTON_NAMES.get(key, key),
+                                             callback_data=f"dec:run:{key}:{lang}:{1 if verbose else 0}:0")
+                   for key in quick])
+    return keyboard
+
+
+def decision_deliver(chat_id: int, text: str, markup=None, edit_message_id: int | None = None) -> None:
+    for chunk in split_broadcast_text(text):
+        if edit_message_id:
+            try:
+                bot.edit_message_text(chunk, chat_id, edit_message_id, reply_markup=markup)
+                markup, edit_message_id = None, None
+                continue
+            except Exception as exc:
+                logger.info("decision edit fell back to send: %s", exc)
+                edit_message_id = None
+        bot.send_message(chat_id, chunk, reply_markup=markup)
+        markup = None
+
+
+def decision_respond(target_message, asset: Asset, lang: str, verbose: bool = False,
+                     force: bool = False, edit_message_id: int | None = None) -> None:
+    markup = decision_keyboard(asset.key, lang, verbose)
+    try:
+        decision, _ = decision_candles(asset, force=force)
+    except DataUnavailable:
+        decision_deliver(target_message.chat.id,
+                         "⛔ " + (AR["data_error"] if lang == "ar" else
+                                 "Reliable market data is unavailable for this asset right now, so no verdict "
+                                 "is produced. No synthetic candles were used."), markup, edit_message_id)
+        return
+    except Exception:
+        logger.exception("strict decision failed for %s", asset.key)
+        decision_deliver(target_message.chat.id,
+                         "⛔ " + ("تعذر إكمال القرار الآن. جرّب إعادة الحساب." if lang == "ar" else
+                                 "The verdict could not be completed right now. Try Recompute."),
+                         markup, edit_message_id)
+        return
+    decision_deliver(target_message.chat.id, render_decision(decision, lang, verbose=verbose), markup, edit_message_id)
+
+
+def parse_decision_arguments(text: str) -> tuple[str | None, str | None, bool]:
+    """Hybrid grammar: /decision [ASSET] [ar|en|both] [gates]."""
+    parts = (text or "").split()
+    supplied = lang = None
+    verbose = False
+    for token in parts[1:]:
+        lowered = token.lower()
+        if lowered in SMC_LANGS:
+            lang = lowered
+        elif lowered in {"gates", "verbose", "بوابات", "كامل"}:
+            verbose = True
+        elif supplied is None and not lowered.startswith("/"):
+            supplied = token
+    return supplied, lang, verbose
+
+
+@bot.message_handler(commands=list(DECISION_COMMANDS))
+def decision_cmd(message: types.Message):
+    supplied, lang_override, verbose = parse_decision_arguments(message.text or "")
+    lang = lang_override or decision_lang_for(message)
+    asset = resolve_asset(supplied) if supplied else None
+    if asset is None:
+        asset = selected_asset(message)
+    if asset is None:
+        bot.reply_to(message,
+                     "اذكر الأصل مثل: /decision BTC أو /decision الذهب." if lang == "ar" else
+                     "Name an asset, for example /decision BTC or /decision gold.",
+                     reply_markup=decision_keyboard("BTC", lang, verbose))
+        return
+    prefs = smc_prefs.setdefault(message.chat.id, {})
+    prefs["lang"] = lang
+    decision_respond(message, asset, lang, verbose, force=True)
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("dec:")))
+def decision_callback(call: types.CallbackQuery):
+    parts = (call.data or "").split(":")
+    if len(parts) < 6:
+        bot.answer_callback_query(call.id)
+        return
+    _, action, asset_key, lang, verbose, force = parts[:6]
+    lang = lang if lang in SMC_LANGS else decision_lang_for(call.message)
+    asset = resolve_asset(asset_key)
+    if asset is None:
+        bot.answer_callback_query(call.id, "أصل غير معروف" if lang == "ar" else "Unknown asset", show_alert=True)
+        return
+    smc_prefs.setdefault(call.message.chat.id, {})["lang"] = lang
+    if action != "run":
+        bot.answer_callback_query(call.id)
+        return
+    decision_respond(call.message, asset, lang, verbose in {"1", "true"}, force=force == "1",
+                     edit_message_id=call.message.message_id if call.message else None)
+    bot.answer_callback_query(call.id)
+
+
 def smc_chart(asset: Asset, report, candles_by_timeframe: dict):
     """Annotated 4H chart drawn from the same real candles the engine used."""
     candles = candles_by_timeframe.get("4h") or []
@@ -1269,6 +1426,19 @@ def text_cmd(message: types.Message):
             return
         smc_respond(message, asset, smc_lang, prefs.get("mode", "full"))
         return
+    if request.intent == "decision":
+        # "قرار البيتكوين", "buy or sell gold", "verdict BTC" -> the strict engine
+        prefs = smc_prefs.setdefault(message.chat.id, {})
+        decision_lang = lang if lang in SMC_LANGS else prefs.get("lang", "en")
+        prefs["lang"] = decision_lang
+        if asset is None:
+            bot.reply_to(message,
+                         "اذكر الأصل مع طلب القرار، مثل: قرار الذهب شراء أم بيع؟" if lang == "ar" else
+                         "Name the asset with the request, for example: buy or sell BTC?",
+                         reply_markup=decision_keyboard("BTC", decision_lang))
+            return
+        decision_respond(message, asset, decision_lang)
+        return
     if request.intent == "risk":
         natural_risk_response(message, lang, text)
         return
@@ -1452,6 +1622,30 @@ def smc_endpoint(asset_key: str):
         payload["summary"] = render_smc_brief(report, lang)
     else:
         payload["report"] = render_smc(report, lang)
+    return jsonify(payload)
+
+
+@app.get("/decision/<asset_key>")
+def decision_endpoint(asset_key: str):
+    """The strict BUY / SELL / WAIT verdict as JSON plus its rendered block.
+
+    Query params: lang (ar|en|both), gates=1 for the full gate chain,
+    refresh=1 to bypass the short cache.
+    """
+    asset = resolve_asset(asset_key)
+    if asset is None:
+        return jsonify({"error": "unknown asset"}), 404
+    lang = request.args.get("lang", "en")
+    if lang not in SMC_LANGS:
+        return jsonify({"error": "lang must be ar, en or both"}), 400
+    verbose = request.args.get("gates") == "1"
+    try:
+        decision, _ = decision_candles(asset, force=request.args.get("refresh") == "1")
+    except DataUnavailable:
+        return jsonify({"error": "no reliable market data for this asset", "asset": asset.key}), 503
+    payload = decision_to_dict(decision)
+    payload["summary"] = render_decision_brief(decision, "ar" if lang == "ar" else "en")
+    payload["report"] = render_decision(decision, lang, verbose=verbose)
     return jsonify(payload)
 
 
