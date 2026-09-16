@@ -465,7 +465,7 @@ def volume_filter(views: dict[str, TimeframeSMC], candles: dict[str, list[Candle
         words.append(f"break candle {confirmation['event'].volume_ratio}x")
     detail = "; ".join(words)
     if problems:
-        detail = "volume contradicts the direction -> trade rejected | " + " · ".join(problems) + " | " + detail
+        detail = "volume filter failed -> trade rejected | " + " · ".join(problems) + " | " + detail
     return {"passed": not problems, "rvol": rvol, "timeframe": trigger.timeframe, "status": status,
             "setup_rvol": setup_rvol, "detail": detail, "problems": tuple(problems), "obv_slope": obv,
             "buy_pct": buy_pct}
