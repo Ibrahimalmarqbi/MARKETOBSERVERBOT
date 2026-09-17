@@ -219,6 +219,58 @@ def test_binary_waits_on_stale_bars_like_a_closed_market():
     assert any(gate.name == "fresh-data" and not gate.passed for gate in verdict.gates)
 
 
+def _doji_5m(candles: list[Candle]) -> list[Candle]:
+    """Rewrite the last 5m candle as a doji (zero body) — same close/HL, so
+    RSI/SMA/ATR are untouched and only the trigger gate loses conviction."""
+    last = candles[-1]
+    doji = Candle(last.timestamp, last.close, last.high, last.low, last.close, last.volume)
+    return candles[:-1] + [doji]
+
+
+def test_scored_mode_enters_on_seven_eights_with_weak_trigger():
+    up_5m = trend_candles(1.0800, 0.0002)
+    up_15m = trend_candles(1.0780, 0.0004)
+    weak = _doji_5m(up_5m)
+    scored = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5, weak, up_15m, "unit-test", strict=False)
+    assert scored.verdict == "CALL"
+    assert scored.expiry_minutes == 15
+    assert scored.score == 7 and scored.entry_mode == "scored"
+    assert to_dict(scored)["strength"] == "STRONG"  # strength is derived from the score
+    assert any(gate.name == "trigger-candle" and not gate.passed for gate in scored.gates)
+    # ...while strict mode (default) stays closed on the same candles.
+    strict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5, weak, up_15m, "unit-test")
+    assert strict.verdict == "WAIT"
+    assert strict.entry_mode == "strict"
+
+
+def test_scored_mode_never_buys_stale_data_with_points():
+    up_5m = trend_candles(1.0800, 0.0002)
+    up_15m = trend_candles(1.0780, 0.0004)
+    verdict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5, up_5m, up_15m, "unit-test",
+                     now=datetime.now(timezone.utc) + timedelta(days=2), strict=False)
+    # Fresh-data is a veto: no amount of points on the rest may open a trade
+    # on a closed market or a dead feed.
+    assert verdict.verdict == "WAIT"
+    assert verdict.score < 6
+    assert to_dict(verdict)["strength"] == "WEAK"
+    assert to_dict(verdict)["entry_mode"] == "scored"
+
+
+def test_render_shows_score_strength_and_reason():
+    up_5m = trend_candles(1.0800, 0.0002)
+    up_15m = trend_candles(1.0780, 0.0004)
+    verdict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5, up_5m, up_15m, "unit-test")
+    text = render(verdict, "ar")
+    assert "8 / 8" in text and "VERY STRONG" in text
+    assert "🎯 القرار: 🟢 CALL" in text
+    assert "🧠 السبب:" in text and "✅ الشروط الناجحة:" in text
+    assert "❌" not in text  # every gate passed
+    wait_text = render(decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5,
+                              trend_candles(1.0900, -0.0002), trend_candles(1.0780, 0.0004),
+                              "unit-test"), "en")
+    assert "Score: " in wait_text and "WEAK" in wait_text and "Why:" in wait_text
+
+
 # ---------------- NLP ----------------
 
 def test_price_and_binary_intents_are_multilingual():
@@ -267,7 +319,7 @@ def test_price_endpoint_uses_the_live_quote(monkeypatch):
 def test_binary_endpoint_renders_both_languages(monkeypatch):
     verdict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5,
                      trend_candles(1.0800, 0.0002), trend_candles(1.0780, 0.0004), "unit-test")
-    monkeypatch.setattr(app, "binary_verdict_for", lambda asset, force=False: verdict)
+    monkeypatch.setattr(app, "binary_verdict_for", lambda asset, force=False, entry_mode=None: verdict)
     client = app.app.test_client()
     response = client.get("/binary/EURUSD?lang=en")
     assert response.status_code == 200
@@ -289,6 +341,8 @@ def telegram(monkeypatch):
     monkeypatch.setattr(app.bot, "reply_to", lambda message, text, **kwargs: SENT.append(text))
     monkeypatch.setattr(app.bot, "send_message", lambda chat_id, text, **kwargs: SENT.append(text))
     monkeypatch.setattr(app.bot, "send_chat_action", lambda *a, **k: None)
+    monkeypatch.setattr(app.bot, "edit_message_text", lambda text, *a, **k: SENT.append(text))
+    monkeypatch.setattr(app.bot, "answer_callback_query", lambda *a, **k: None)
     monkeypatch.setattr(app.bot, "threaded", False)
     yield
 
@@ -316,7 +370,7 @@ def test_price_command_replies_with_source_and_age(telegram, monkeypatch):
 def test_binary_command_and_natural_language(telegram, monkeypatch):
     verdict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5,
                      trend_candles(1.0800, 0.0002), trend_candles(1.0780, 0.0004), "unit-test")
-    monkeypatch.setattr(app, "binary_verdict_for", lambda asset, force=False: verdict)
+    monkeypatch.setattr(app, "binary_verdict_for", lambda asset, force=False, entry_mode=None: verdict)
     app.bot.process_new_updates([message_update("/binary EURUSD")])
     assert SENT and "CALL" in SENT[-1]
     SENT.clear()
@@ -337,3 +391,70 @@ def test_binary_keyboard_respects_telegram_limits():
             assert len(row) <= 10
             for button in row:
                 assert 1 <= len((button.callback_data or "").encode("utf-8")) <= 64
+
+
+def _keyboard_data(keyboard) -> list:
+    return [button.callback_data for row in keyboard.keyboard for button in row]
+
+
+def test_binary_keyboard_exposes_refresh_compare_and_settings():
+    for lang in ("ar", "en"):
+        data = _keyboard_data(app.binary_keyboard("EURUSD", lang))
+        assert any(item == f"bin:run:EURUSD:{lang}:1" for item in data)          # refresh
+        assert any(item.startswith(f"bin:compare:EURUSD:{lang}") for item in data)
+        assert any(item.startswith(f"bin:settings:EURUSD:{lang}") for item in data)
+        settings_data = _keyboard_data(app.binary_settings_keyboard("EURUSD", lang))
+        assert f"set:mode:EURUSD:{lang}:strict" in settings_data
+        assert f"set:mode:EURUSD:{lang}:scored" in settings_data
+        assert f"set:lang:EURUSD:ar:0" in settings_data
+        assert f"set:back:EURUSD:{lang}:0" in settings_data
+
+
+def callback_update(data, chat_id=4242, message_id=8):
+    return app.types.Update.de_json(json.dumps({
+        "update_id": 2,
+        "callback_query": {
+            "id": "cb-test", "chat_instance": "1", "data": data,
+            "from": {"id": chat_id, "is_bot": False, "first_name": "Tester"},
+            "message": {
+                "message_id": message_id, "date": 1789500000,
+                "chat": {"id": chat_id, "type": "private", "first_name": "Tester"},
+                "from": {"id": chat_id, "is_bot": False, "first_name": "Tester"},
+                "text": "previous report",
+            },
+        },
+    }))
+
+
+def test_settings_mode_toggle_persists_and_applies(telegram, monkeypatch):
+    verdict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5,
+                     trend_candles(1.0800, 0.0002), trend_candles(1.0780, 0.0004), "unit-test")
+    seen_modes: list = []
+
+    def fake_verdict_for(asset, force=False, entry_mode=None):
+        seen_modes.append(entry_mode)
+        return verdict
+
+    monkeypatch.setattr(app, "binary_verdict_for", fake_verdict_for)
+    app.db.set_binary_mode(4242, None)  # start from the global default
+    try:
+        # /binary creates the user row and shows the verdict (strict default).
+        app.bot.process_new_updates([message_update("/binary EURUSD")])
+        assert SENT and "CALL" in SENT[-1]
+        assert seen_modes[-1] == "strict"
+        # Open ⚙️ settings from the verdict message.
+        SENT.clear()
+        app.bot.process_new_updates([callback_update("bin:settings:EURUSD:ar:0")])
+        assert SENT and "⚙️ ضبط البوت" in SENT[-1] and "strict" in SENT[-1]
+        # Toggle to scored — persisted on the account.
+        SENT.clear()
+        app.bot.process_new_updates([callback_update("set:mode:EURUSD:ar:scored")])
+        assert SENT and "تم الحفظ" in SENT[-1]
+        assert app.db.get_user(4242).binary_mode == "scored"
+        # Back to analysis — the verdict now runs in the user's own mode.
+        SENT.clear()
+        app.bot.process_new_updates([callback_update("set:back:EURUSD:ar:0")])
+        assert SENT and "CALL" in SENT[-1]
+        assert seen_modes[-1] == "scored"
+    finally:
+        app.db.set_binary_mode(4242, None)

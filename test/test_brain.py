@@ -267,7 +267,7 @@ def test_release_snapshots_and_followup_measures(telegram, monkeypatch):
     monkeypatch.setattr(app.calendar_feed, "due_for_followup", lambda *a, **k: list(group))
     prices["XAUUSD"] = 4723.5  # +0.5%
     fake_verdict = type("V", (), {"verdict": "CALL", "confidence": "medium"})()
-    monkeypatch.setattr(app, "binary_verdict_for", lambda asset, force=False: fake_verdict)
+    monkeypatch.setattr(app, "binary_verdict_for", lambda asset, force=False, entry_mode=None: fake_verdict)
     monkeypatch.setattr(app.market, "get_candles", lambda asset, interval, limit: up_candles())
     SENT.clear()
     app.scan_calendar(NOW + timedelta(minutes=31))

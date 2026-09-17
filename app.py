@@ -4,6 +4,7 @@ import html
 import io
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -33,7 +34,7 @@ from marketobserver.learning import calibration_for, resolve_due as resolve_jour
 from marketobserver.live import LivePriceProvider, Quote, QuoteUnavailable
 from marketobserver.market_data import DataUnavailable, MarketDataProvider
 from marketobserver.binary import decide as build_binary_verdict, render as render_binary, to_dict as binary_to_dict
-from marketobserver.backtest import HistoryUnavailable, backtest as run_backtest, render as render_backtest, to_dict as backtest_to_dict
+from marketobserver.backtest import HistoryUnavailable, backtest as run_backtest, compare as compare_binary_modes, render as render_backtest, render_compare as render_binary_compare, to_dict as backtest_to_dict
 from marketobserver.research import MarketResearch, ResearchSnapshot, headline_age_hours, headline_fingerprint, headline_importance_level, is_fresh
 from marketobserver.risk import calculate_position_size
 from marketobserver.llm import GroundedLLM
@@ -787,17 +788,37 @@ def backtest_cmd(message: types.Message):
     asset = selected_asset(message, asset_token) if asset_token else selected_asset(message)
     remember_user(message, asset)
     if asset is None:
-        bot.reply_to(message, "اذكر الأصل مثل: /backtest EURUSD 30" if lang == "ar" else "Name an asset, for example /backtest EURUSD 30.")
+        hint = ("اذكر الأصل مثل: /backtest EURUSD 30 — أضف both في النهاية لمقارنة وضعي الدخول"
+                if lang == "ar" else
+                "Name an asset, for example /backtest EURUSD 30 — append both to compare entry modes")
+        bot.reply_to(message, hint)
         return
     try:
         numbers = extract_numbers(" ".join(parts[2:])) if len(parts) >= 3 else []
         days = max(7, min(60, int(numbers[0]))) if numbers else 30
     except (ValueError, IndexError):
         days = 30
+    compare_requested = any(token.lower() in {"both", "compare", "مقارنة", "قارن"} for token in parts[2:])
+    if compare_requested:
+        bot.reply_to(message, f"🧪 أقارن وضعي الدخول على {asset.key} آخر ~{days} يومًا... قد يستغرق دقيقة." if lang == "ar"
+                      else f"Comparing entry modes on {asset.key} for ~{days} days... this can take a minute.")
+        try:
+            bot.send_chat_action(message.chat.id, "typing")
+            strict_res, scored_res = compare_binary_modes(asset, days)
+        except HistoryUnavailable:
+            bot.reply_to(message, AR["data_error"] if lang == "ar" else "Not enough historical data for this comparison.")
+            return
+        except Exception:
+            logger.exception("mode comparison failed for %s", asset.key)
+            bot.reply_to(message, "تعذر إكمال المقارنة الآن." if lang == "ar" else "The comparison could not be completed right now.")
+            return
+        bot.send_message(message.chat.id, render_binary_compare(strict_res, scored_res, lang),
+                         parse_mode="HTML", disable_web_page_preview=True)
+        return
     bot.reply_to(message, f"🧪 أختبر {asset.key} على ~{days} يومًا... قد يستغرق هذا دقيقة." if lang == "ar" else f"🧪 Backtesting {asset.key} on ~{days} days... this can take a minute.")
     try:
         bot.send_chat_action(message.chat.id, "typing")
-        result = run_backtest(asset, days)
+        result = run_backtest(asset, days, strict=binary_mode_for(message.chat.id) != "scored")
         bot.send_message(message.chat.id, render_backtest(result, lang), parse_mode="HTML", disable_web_page_preview=True)
     except HistoryUnavailable:
         bot.reply_to(message, AR["data_error"] if lang == "ar" else "Not enough historical data for this backtest.")
@@ -1388,10 +1409,34 @@ def decision_callback(call: types.CallbackQuery):
 BINARY_TIMEFRAMES = ("5m", "15m")
 BINARY_TTL_SECONDS = 30
 binary_cache: dict[str, tuple[float, object]] = {}
+# Entry mode: "strict" (default) requires all 8 gates — the original rule.
+# "scored" enters when the 6 safety (veto) gates pass, i.e. score >= 6/8, and
+# grades strength from the score. The backtest always measures the SAME mode
+# so /backtest compares the strategy you actually run.
+BINARY_ENTRY_MODE = os.getenv("BINARY_ENTRY_MODE", "strict").strip().lower()
+if BINARY_ENTRY_MODE not in {"strict", "scored"}:
+    BINARY_ENTRY_MODE = "strict"
+BINARY_STRICT = BINARY_ENTRY_MODE != "scored"
 
 
-def binary_verdict_for(asset: Asset, force: bool = False):
-    cached = binary_cache.get(asset.key)
+def binary_mode_for(chat_id: int | None) -> str:
+    """Effective binary entry mode: the user's personal setting (⚙️ الضبط)
+    wins; otherwise the global BINARY_ENTRY_MODE default."""
+    if chat_id:
+        try:
+            user = db.get_user(chat_id)
+        except Exception:
+            logger.exception("binary mode lookup failed for chat %s", chat_id)
+            user = None
+        if user is not None and user.binary_mode in {"strict", "scored"}:
+            return user.binary_mode
+    return BINARY_ENTRY_MODE
+
+
+def binary_verdict_for(asset: Asset, force: bool = False, entry_mode: str | None = None):
+    mode = entry_mode if entry_mode in {"strict", "scored"} else BINARY_ENTRY_MODE
+    cache_key = f"{asset.key}:{mode}"
+    cached = binary_cache.get(cache_key)
     if cached and not force and time.time() - cached[0] < BINARY_TTL_SECONDS:
         return cached[1]
     candles: dict[str, list] = {}
@@ -1408,33 +1453,138 @@ def binary_verdict_for(asset: Asset, force: bool = False):
         live_price = None
     verdict = build_binary_verdict(asset.key, asset.name_ar, asset.name_en, asset.quote,
                                    asset.price_decimals, candles["5m"], candles["15m"],
-                                   market.last_source(asset.key) or "unknown", live_price)
-    binary_cache[asset.key] = (time.time(), verdict)
+                                   market.last_source(asset.key) or "unknown", live_price,
+                                   strict=mode != "scored")
+    binary_cache[cache_key] = (time.time(), verdict)
     return verdict
 
 
 def binary_keyboard(asset_key: str, lang: str) -> types.InlineKeyboardMarkup:
+    ar = lang == "ar"
     keyboard = types.InlineKeyboardMarkup(row_width=3)
+    # Row 1+: asset switcher (selected asset marked ✅)
     for index in range(0, len(BINARY_POPULAR), 3):
         row = BINARY_POPULAR[index:index + 3]
         keyboard.add(*[types.InlineKeyboardButton(
             ("✅ " if key == asset_key else "") + SMC_BUTTON_NAMES.get(key, key),
             callback_data=f"bin:run:{key}:{lang}:0") for key in row])
+    # Action row: refresh the verdict, compare entry modes on real history,
+    # open the bot settings panel.
     keyboard.add(
-        types.InlineKeyboardButton("🔄 تحديث" if lang == "ar" else "🔄 Refresh",
+        types.InlineKeyboardButton("🔄 تحديث" if ar else "🔄 Refresh",
                                    callback_data=f"bin:run:{asset_key}:{lang}:1"),
-        types.InlineKeyboardButton("🇸🇦 عربي" if lang == "ar" else "🇸🇦 AR",
-                                   callback_data=f"bin:run:{asset_key}:ar:0"),
+        types.InlineKeyboardButton("⚖️ قارن الوضعين" if ar else "⚖️ Compare modes",
+                                   callback_data=f"bin:compare:{asset_key}:{lang}:0"),
+        types.InlineKeyboardButton("⚙️ الضبط" if ar else "⚙️ Settings",
+                                   callback_data=f"bin:settings:{asset_key}:{lang}:0"),
+    )
+    # Language row: re-render the same report in the other language.
+    keyboard.add(
+        types.InlineKeyboardButton("🇸🇦 عربي", callback_data=f"bin:run:{asset_key}:ar:0"),
         types.InlineKeyboardButton("🇬🇧 EN", callback_data=f"bin:run:{asset_key}:en:0"),
     )
     return keyboard
 
 
+def binary_settings_keyboard(asset_key: str, lang: str) -> types.InlineKeyboardMarkup:
+    ar = lang == "ar"
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("🔒 strict — إلزامي 8/8" if ar else "🔒 strict — all 8 gates",
+                                   callback_data=f"set:mode:{asset_key}:{lang}:strict"),
+        types.InlineKeyboardButton("📊 scored — من 6/8" if ar else "📊 scored — from 6/8",
+                                   callback_data=f"set:mode:{asset_key}:{lang}:scored"),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton("🇸🇦 عربي", callback_data=f"set:lang:{asset_key}:ar:0"),
+        types.InlineKeyboardButton("🇬🇧 EN", callback_data=f"set:lang:{asset_key}:en:0"),
+    )
+    keyboard.add(types.InlineKeyboardButton("↩️ رجوع للتحليل" if ar else "↩️ Back to analysis",
+                                            callback_data=f"set:back:{asset_key}:{lang}:0"))
+    return keyboard
+
+
+def binary_settings_respond(target_message, asset: Asset, lang: str,
+                            notice: str | None = None,
+                            edit_message_id: int | None = None) -> None:
+    """⚙️ Settings panel: shows the effective /binary entry mode and language,
+    and lets the user persist their own entry mode for this account."""
+    chat_id = target_message.chat.id
+    saved = None
+    try:
+        user = db.get_user(chat_id)
+        if user is not None and user.binary_mode in {"strict", "scored"}:
+            saved = user.binary_mode
+    except Exception:
+        logger.exception("settings read failed for chat %s", chat_id)
+    effective = saved or BINARY_ENTRY_MODE
+    mode_desc = {
+        "strict": "🔒 strict — كل البوابات الثمانية إلزامية (8/8)" if lang == "ar"
+                  else "🔒 strict — all eight gates required (8/8)",
+        "scored": "📊 scored — الدخول عند 6/8 فأكثر (بوابات السلامة الست + جودة البقيتين)" if lang == "ar"
+                  else "📊 scored — enter at 6/8 or above (6 safety gates + quality gates)",
+    }[effective]
+    if lang == "ar":
+        lines = [
+            f"⚙️ ضبط البوت — {asset.name_ar} ({asset.key})",
+            "",
+            "🎯 وضع دخول /binary:",
+            f"   الحالي: {effective} — ({'ضبطك الشخصي' if saved else 'الافتراضي العام'})",
+            f"   {mode_desc}",
+            "",
+            f"🌐 اللغة: {'عربي' if lang == 'ar' else 'English'}",
+        ]
+        if notice:
+            lines += ["", notice]
+        lines += ["", "التغييرات تُحفظ على حسابك وتُطبَّق فورًا على القرارات والباك تست."]
+    else:
+        lines = [
+            f"⚙️ Bot settings — {asset.name_en} ({asset.key})",
+            "",
+            "🎯 /binary entry mode:",
+            f"   current: {effective} — ({'your personal setting' if saved else 'global default'})",
+            f"   {mode_desc}",
+            "",
+            "🌐 Language: English",
+        ]
+        if notice:
+            lines += ["", notice]
+        lines += ["", "Changes are saved to your account and apply to verdicts and backtests immediately."]
+    markup = binary_settings_keyboard(asset.key, lang)
+    deliver_smc(chat_id, "\n".join(lines), markup, edit_message_id=edit_message_id)
+
+
+def compare_binary_respond(target_message, asset: Asset, lang: str, days: int = 30) -> None:
+    """⚖️ Run the SAME history through both entry modes and show a side-by-side
+    report, so the user lets data — not vibes — pick the mode."""
+    chat_id = target_message.chat.id
+    name = asset.name_ar if lang == "ar" else asset.name_en
+    progress = (f"🧪 أقوم بمقارنة وضعي الدخول (strict/scored) على آخر ~{days} يومًا من {name}..."
+                if lang == "ar"
+                else f"Comparing entry modes (strict/scored) on the last ~{days} days of {name}...")
+    bot.send_message(chat_id, progress)
+    try:
+        bot.send_chat_action(chat_id, "typing")
+        strict_res, scored_res = compare_binary_modes(asset, days)
+    except HistoryUnavailable:
+        bot.send_message(chat_id, AR["data_error"] if lang == "ar"
+                         else "Not enough historical data for this comparison.")
+        return
+    except Exception:
+        logger.exception("mode comparison failed for %s", asset.key)
+        bot.send_message(chat_id, "تعذر إكمال المقارنة الآن." if lang == "ar"
+                                  else "The comparison could not be completed right now.")
+        return
+    bot.send_message(chat_id, render_binary_compare(strict_res, scored_res, lang),
+                     parse_mode="HTML", disable_web_page_preview=True)
+
+
 def binary_respond(target_message, asset: Asset, lang: str, force: bool = False,
                    edit_message_id: int | None = None) -> None:
     markup = binary_keyboard(asset.key, lang)
+    entry_mode = binary_mode_for(target_message.chat.id)
     try:
-        verdict = binary_verdict_for(asset, force=force)
+        verdict = binary_verdict_for(asset, force=force, entry_mode=entry_mode)
     except DataUnavailable:
         text = "⛔ " + (AR["data_error"] if lang == "ar" else
                         "Reliable 5m/15m market data is unavailable for this asset right now, so no binary verdict is produced.")
@@ -1455,7 +1605,7 @@ def binary_respond(target_message, asset: Asset, lang: str, force: bool = False,
             try:
                 db.journal_add("binary", asset.key, verdict.verdict, ref,
                                verdict.expiry_minutes or 15, chat_id=target_message.chat.id,
-                               note=f"conf:{verdict.confidence}")
+                               note=f"mode:{verdict.entry_mode} conf:{verdict.confidence} score:{verdict.score}/8")
             except Exception:
                 logger.exception("binary journal failed")
         calibration = calibration_for(db, asset.key, verdict.verdict)
@@ -1487,7 +1637,7 @@ def binary_callback(call: types.CallbackQuery):
     if len(parts) < 5:
         bot.answer_callback_query(call.id)
         return
-    _, _, asset_key, lang, force = parts[:5]
+    _, action, asset_key, lang, force = parts[:5]
     lang = lang if lang in ("ar", "en") else "ar"
     asset = ASSETS.get(asset_key) or resolve_asset(asset_key)
     if asset is None:
@@ -1495,8 +1645,46 @@ def binary_callback(call: types.CallbackQuery):
         return
     smc_prefs.setdefault(call.message.chat.id, {})["lang"] = lang
     db.set_last_asset(call.message.chat.id, asset.key)
-    binary_respond(call.message, asset, lang, force=force == "1",
-                   edit_message_id=call.message.message_id if call.message else None)
+    if action == "compare":
+        compare_binary_respond(call.message, asset, lang)
+    elif action == "settings":
+        binary_settings_respond(call.message, asset, lang,
+                                edit_message_id=call.message.message_id if call.message else None)
+    else:  # run (default)
+        binary_respond(call.message, asset, lang, force=force == "1",
+                       edit_message_id=call.message.message_id if call.message else None)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("set:")))
+def binary_settings_callback(call: types.CallbackQuery):
+    """⚙️ Settings panel actions: persist entry mode, switch language, go back."""
+    parts = (call.data or "").split(":")
+    if len(parts) < 5:
+        bot.answer_callback_query(call.id)
+        return
+    _, action, asset_key, slot, flag = parts[:5]
+    asset = ASSETS.get(asset_key) or resolve_asset(asset_key)
+    chat_id = call.message.chat.id
+    if asset is None:
+        bot.answer_callback_query(call.id, "أصل غير معروف" if slot in ("ar", "en") else "Unknown asset", show_alert=True)
+        return
+    lang = slot if slot in ("ar", "en") else (smc_prefs.get(chat_id, {}) or {}).get("lang") or "ar"
+    if lang not in ("ar", "en"):
+        lang = "ar"
+    smc_prefs.setdefault(chat_id, {})["lang"] = lang
+    edit_message_id = call.message.message_id if call.message else None
+    if action == "mode" and flag in ("strict", "scored"):
+        db.set_binary_mode(chat_id, flag)
+        notice = ("⚙️ تم الحفظ: وضع الدخول الآن " + flag if lang == "ar"
+                  else "Saved: entry mode is now " + flag)
+        binary_settings_respond(call.message, asset, lang, notice=notice,
+                                edit_message_id=edit_message_id)
+    elif action == "lang" and slot in ("ar", "en"):
+        binary_settings_respond(call.message, asset, slot, edit_message_id=edit_message_id)
+    elif action == "back":
+        db.set_last_asset(chat_id, asset.key)
+        binary_respond(call.message, asset, lang, edit_message_id=edit_message_id)
     bot.answer_callback_query(call.id)
 
 
@@ -1800,7 +1988,7 @@ def text_cmd(message: types.Message):
             days = 30
         bot.reply_to(message, f"🧪 أختبر {asset.key} على ~{days} يومًا... قد يستغرق هذا دقيقة." if lang == "ar" else f"🧪 Backtesting {asset.key} on ~{days} days... this can take a minute.")
         try:
-            result = run_backtest(asset, days)
+            result = run_backtest(asset, days, strict=binary_mode_for(message.chat.id) != "scored")
             bot.send_message(message.chat.id, render_backtest(result, lang), parse_mode="HTML", disable_web_page_preview=True)
         except HistoryUnavailable:
             bot.reply_to(message, AR["data_error"] if lang == "ar" else "Not enough historical data for this backtest.")
@@ -2514,7 +2702,7 @@ def stats_endpoint():
 
 @app.get("/backtest/<asset_key>")
 def backtest_endpoint(asset_key: str):
-    """Walk-forward binary backtest. Query: days (7-60), payout, lang."""
+    """Walk-forward binary backtest. Query: days (7-60), payout, lang, compare=1."""
     asset = resolve_asset(asset_key)
     if asset is None:
         return jsonify({"error": "unknown asset"}), 404
@@ -2528,8 +2716,19 @@ def backtest_endpoint(asset_key: str):
     lang = request.args.get("lang", "ar")
     if lang not in {"ar", "en"}:
         return jsonify({"error": "lang must be ar or en"}), 400
+    if request.args.get("compare", "0") in {"1", "true"}:
+        # Same history through both entry modes — the only variable is the rule.
+        try:
+            strict_res, scored_res = compare_binary_modes(asset, days, payout)
+        except HistoryUnavailable:
+            return jsonify({"error": "not enough historical data", "asset": asset.key}), 503
+        return jsonify({
+            "asset": asset.key,
+            "compare": {"strict": backtest_to_dict(strict_res), "scored": backtest_to_dict(scored_res)},
+            "report": render_binary_compare(strict_res, scored_res, lang),
+        })
     try:
-        result = run_backtest(asset, days, payout)
+        result = run_backtest(asset, days, payout, strict=BINARY_STRICT)
     except HistoryUnavailable:
         return jsonify({"error": "not enough historical data", "asset": asset.key}), 503
     payload = backtest_to_dict(result)

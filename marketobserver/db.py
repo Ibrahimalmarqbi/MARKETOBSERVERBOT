@@ -54,6 +54,7 @@ class User(Base):
     calendar_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     capital: Mapped[float] = mapped_column(Float, default=1000.0)
     risk_percent: Mapped[float] = mapped_column(Float, default=1.0)
+    binary_mode: Mapped[str | None] = mapped_column(String(10), nullable=True)  # strict | scored; None = global default
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -203,6 +204,8 @@ class Database:
             missing.append("ALTER TABLE users ADD COLUMN capital DOUBLE PRECISION DEFAULT 1000.0")
         if "risk_percent" not in columns:
             missing.append("ALTER TABLE users ADD COLUMN risk_percent DOUBLE PRECISION DEFAULT 1.0")
+        if "binary_mode" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN binary_mode VARCHAR(10) NULL")
         if missing:
             with self.engine.begin() as connection:
                 for statement in missing:
@@ -269,6 +272,11 @@ class Database:
     def set_risk_percent(self, chat_id: int, risk_percent: float) -> None:
         with self.session() as s:
             s.execute(update(User).where(User.chat_id == chat_id).values(risk_percent=risk_percent, updated_at=utcnow()))
+
+    def set_binary_mode(self, chat_id: int, mode: str | None) -> None:
+        """Persist the user's binary entry mode. None = follow the global default."""
+        with self.session() as s:
+            s.execute(update(User).where(User.chat_id == chat_id).values(binary_mode=mode, updated_at=utcnow()))
 
     def set_calendar_enabled(self, chat_id: int, enabled: bool) -> None:
         with self.session() as s:
