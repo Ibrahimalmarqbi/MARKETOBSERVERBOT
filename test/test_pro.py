@@ -5,6 +5,7 @@ fallback chain, TTL cache and parsers are exercised deterministically.
 """
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -254,6 +255,65 @@ def test_scored_mode_never_buys_stale_data_with_points():
     assert verdict.score < 6
     assert to_dict(verdict)["strength"] == "WEAK"
     assert to_dict(verdict)["entry_mode"] == "scored"
+
+
+def test_free_translate_parses_segments_and_fails_safely(monkeypatch):
+    from marketobserver import llm as llm_mod
+
+    class OkResponse:
+        # Real gtx segments carry their own spacing (["عنوان ", "ثاني"]).
+        status_code = 200
+        def json(self):
+            return [[["عنوان ", "Headline ", None, None], ["ثاني", "Second", None, None]], []]
+
+    class BadResponse:
+        status_code = 500
+        def json(self):
+            raise RuntimeError("no json")
+
+    monkeypatch.setattr(llm_mod.requests, "get", lambda *a, **k: OkResponse())
+    assert llm_mod.free_translate("Headline Second") == "عنوان ثاني"
+
+    monkeypatch.setattr(llm_mod.requests, "get", lambda *a, **k: BadResponse())
+    assert llm_mod.free_translate("Headline") is None
+    assert llm_mod.free_translate("") is None
+    monkeypatch.setattr(llm_mod.requests, "get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("network down")))
+    assert llm_mod.free_translate("Headline") is None
+
+
+def test_translated_headline_uses_fallback_when_llm_unavailable(monkeypatch):
+    from marketobserver.llm import LLMUnavailable
+
+    class UnavailableLLM:
+        enabled = False
+        def translate_headline(self, headline, target_language):
+            raise LLMUnavailable("LLM is not configured")
+
+    monkeypatch.setattr(app, "llm", UnavailableLLM())
+    monkeypatch.setattr(app, "free_translate", lambda text, target="ar": "العنوان بالعربية")
+    app._translated_headline.cache_clear()
+    try:
+        assert app._translated_headline("Some English Headline", "ar") == "العنوان بالعربية"
+        # English users and already-Arabic headlines pass through untouched.
+        assert app._translated_headline("Some English Headline", "en") == "Some English Headline"
+        assert app._translated_headline("عنوان عربي", "ar") == "عنوان عربي"
+    finally:
+        app._translated_headline.cache_clear()
+
+
+def test_arabic_binary_report_keeps_english_only_in_known_terms():
+    """User-facing Arabic report: gate details must be Arabic; only the
+    technical gate names and the CALL/PUT/WAIT trading terms stay Latin."""
+    verdict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5,
+                     trend_candles(1.0800, 0.0002), trend_candles(1.0780, 0.0004), "unit-test")
+    text = render(verdict, "ar")
+    for line in text.splitlines():
+        if not line.startswith("- "):
+            continue
+        detail = line.split(": ", 1)[1] if ": " in line else ""
+        leaks = [word for word in re.findall(r"[A-Za-z]{4,}", detail)
+                 if word not in {"CALL", "PUT", "WAIT"}]
+        assert not leaks, f"English leaked into the Arabic report: {line!r}"
 
 
 def test_render_shows_score_strength_and_reason():

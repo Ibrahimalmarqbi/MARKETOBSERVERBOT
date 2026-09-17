@@ -3,11 +3,37 @@ from __future__ import annotations
 import json
 import logging
 
+import requests
+
 logger = logging.getLogger(__name__)
 
 
 class LLMUnavailable(RuntimeError):
     pass
+
+
+def free_translate(text: str, target: str = "ar") -> str | None:
+    """Keyless fallback translation (public Google widget endpoint).
+
+    Used only when no LLM_API_KEY is configured, so Arabic users still get
+    Arabic news headlines. Returns None on any failure — callers keep the
+    original text rather than failing the feature.
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        response = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "auto", "tl": target, "dt": "t", "q": text[:500]},
+            timeout=(3, 8),
+        )
+        if response.status_code != 200:
+            return None
+        segments = response.json()[0]
+        translated = "".join(seg[0] for seg in segments if seg and seg[0])
+        return translated.strip() or None
+    except Exception:
+        return None
 
 
 class GroundedLLM:

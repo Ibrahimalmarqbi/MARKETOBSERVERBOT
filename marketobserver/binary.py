@@ -67,6 +67,8 @@ DECISIVE_GATES = ("fresh-data", "trend-agreement", "rsi-band",
                   "trigger-candle", "no-spike", "price-vs-sma20")
 
 STRENGTHS = {TOTAL_SCORE: "VERY STRONG", 7: "STRONG", 6: "MODERATE"}
+# Arabic trend words for gate details.
+_TREND_W = {"bullish": "صاعد", "bearish": "هابط", "sideways": "عرضي"}
 
 
 def strength_for(score: int, verdict: str) -> str:
@@ -80,7 +82,12 @@ def strength_for(score: int, verdict: str) -> str:
 class Gate:
     name: str
     passed: bool
-    detail: str
+    detail: str  # English canonical detail (also used in tests/backtests)
+    detail_ar: str = ""  # Arabic rendering for the user-facing report
+
+
+def _gate(name: str, passed: bool, detail: str, detail_ar: str) -> Gate:
+    return Gate(name, passed, detail, detail_ar)
 
 
 @dataclass(frozen=True)
@@ -121,13 +128,19 @@ def decide(asset_key: str, asset_ar: str, asset_en: str, quote: str, decimals: i
     as_of = moment.isoformat()
 
     if not candles_5m or len(candles_5m) < MIN_CANDLES:
-        gates.append(Gate("data-5m", False, f"needs {MIN_CANDLES} closed 5m candles, got {len(candles_5m or [])}"))
+        got = len(candles_5m or [])
+        gates.append(_gate("data-5m", False, f"needs {MIN_CANDLES} closed 5m candles, got {got}",
+                           f"مطلوب {MIN_CANDLES} شمعة 5m مغلقة على الأقل، وصلت {got}"))
     else:
-        gates.append(Gate("data-5m", True, f"{len(candles_5m)} closed 5m candles"))
+        gates.append(_gate("data-5m", True, f"{len(candles_5m)} closed 5m candles",
+                           f"{len(candles_5m)} شمعة 5m مغلقة"))
     if not candles_15m or len(candles_15m) < MIN_CANDLES:
-        gates.append(Gate("data-15m", False, f"needs {MIN_CANDLES} closed 15m candles, got {len(candles_15m or [])}"))
+        got = len(candles_15m or [])
+        gates.append(_gate("data-15m", False, f"needs {MIN_CANDLES} closed 15m candles, got {got}",
+                           f"مطلوب {MIN_CANDLES} شمعة 15m مغلقة على الأقل، وصلت {got}"))
     else:
-        gates.append(Gate("data-15m", True, f"{len(candles_15m)} closed 15m candles"))
+        gates.append(_gate("data-15m", True, f"{len(candles_15m)} closed 15m candles",
+                           f"{len(candles_15m)} شمعة 15m مغلقة"))
 
     if candles_5m and len(candles_5m) >= MIN_CANDLES:
         newest = candles_5m[-1].timestamp
@@ -135,10 +148,11 @@ def decide(asset_key: str, asset_ar: str, asset_en: str, quote: str, decimals: i
             newest = newest.replace(tzinfo=timezone.utc)
         age_minutes = (moment - newest).total_seconds() / 60
         fresh = age_minutes <= MAX_BAR_AGE["hours"] * 60
-        gates.append(Gate("fresh-data", fresh,
-                          f"newest 5m bar is {age_minutes:.0f} min old" + ("" if fresh else " — market closed or stale feed")))
+        gates.append(_gate("fresh-data", fresh,
+                           f"newest 5m bar is {age_minutes:.0f} min old" + ("" if fresh else " — market closed or stale feed"),
+                           f"أحدث شمعة 5m عمرها {age_minutes:.0f} دقيقة" + ("" if fresh else " — السوق مغلق أو المزود متعطل")))
     else:
-        gates.append(Gate("fresh-data", False, "no 5m bars to date"))
+        gates.append(_gate("fresh-data", False, "no 5m bars to date", "لا توجد شموع 5m بعد"))
 
     view_5m: Analysis | None = None
     view_15m: Analysis | None = None
@@ -147,7 +161,7 @@ def decide(asset_key: str, asset_ar: str, asset_en: str, quote: str, decimals: i
             view_5m = analyze(candles_5m, decimals)  # type: ignore[arg-type]
             view_15m = analyze(candles_15m, decimals)  # type: ignore[arg-type]
         except ValueError as exc:
-            gates.append(Gate("indicators", False, str(exc)))
+            gates.append(_gate("indicators", False, str(exc), f"تعذر حساب المؤشرات ({exc})"))
 
     reference = round(view_5m.price, decimals) if view_5m else None
     if live_price is not None and reference:
@@ -158,21 +172,28 @@ def decide(asset_key: str, asset_ar: str, asset_en: str, quote: str, decimals: i
     direction: str | None = None
     if view_5m and view_15m:
         trends = (view_15m.trend, view_5m.trend)
+        trend_ar = f"15m {_TREND_W.get(trends[0], trends[0])} | 5m {_TREND_W.get(trends[1], trends[1])}"
         if trends[0] == trends[1] and trends[0] in {"bullish", "bearish"}:
             direction = "CALL" if trends[0] == "bullish" else "PUT"
-            gates.append(Gate("trend-agreement", True, f"15m={trends[0]} 5m={trends[1]}"))
+            gates.append(_gate("trend-agreement", True, f"15m={trends[0]} 5m={trends[1]}", trend_ar))
         else:
-            gates.append(Gate("trend-agreement", False, f"15m={trends[0]} 5m={trends[1]} — frames disagree"))
+            gates.append(_gate("trend-agreement", False, f"15m={trends[0]} 5m={trends[1]} — frames disagree",
+                               trend_ar + " — الفريمات غير متفقين"))
 
         if direction == "CALL":
             in_band = RSI_CALL[0] <= view_15m.rsi <= RSI_CALL[1] and RSI_CALL[0] <= view_5m.rsi <= RSI_CALL[1] + 3
-            gates.append(Gate("rsi-band", in_band, f"15m RSI {view_15m.rsi}, 5m RSI {view_5m.rsi} (CALL band {RSI_CALL[0]}-{RSI_CALL[1]})"))
+            gates.append(_gate("rsi-band", in_band,
+                               f"15m RSI {view_15m.rsi}, 5m RSI {view_5m.rsi} (CALL band {RSI_CALL[0]}-{RSI_CALL[1]})",
+                               f"RSI 15m = {view_15m.rsi} | RSI 5m = {view_5m.rsi} — نطاق CALL: {RSI_CALL[0]:.0f}-{RSI_CALL[1]:.0f}"))
         elif direction == "PUT":
             in_band = RSI_PUT[0] <= view_15m.rsi <= RSI_PUT[1] and RSI_PUT[0] - 3 <= view_5m.rsi <= RSI_PUT[1]
-            gates.append(Gate("rsi-band", in_band, f"15m RSI {view_15m.rsi}, 5m RSI {view_5m.rsi} (PUT band {RSI_PUT[0]}-{RSI_PUT[1]})"))
+            gates.append(_gate("rsi-band", in_band,
+                               f"15m RSI {view_15m.rsi}, 5m RSI {view_5m.rsi} (PUT band {RSI_PUT[0]}-{RSI_PUT[1]})",
+                               f"RSI 15m = {view_15m.rsi} | RSI 5m = {view_5m.rsi} — نطاق PUT: {RSI_PUT[0]:.0f}-{RSI_PUT[1]:.0f}"))
         else:
             in_band = False
-            gates.append(Gate("rsi-band", False, "no direction to band — trend gate failed first"))
+            gates.append(_gate("rsi-band", False, "no direction to band — trend gate failed first",
+                               "لا يوجد اتجاه — بوابة الاتجاه فشلت أولًا"))
 
         if direction and in_band and candles_5m:
             trigger = _trigger_candle(candles_5m)
@@ -181,20 +202,25 @@ def decide(asset_key: str, asset_ar: str, asset_en: str, quote: str, decimals: i
             body_fraction = (body / candle_range) if candle_range > 0 else 0.0
             aligned = (trigger.close > trigger.open) if direction == "CALL" else (trigger.close < trigger.open)
             decisive = body_fraction >= MIN_BODY_FRACTION
-            gates.append(Gate("trigger-candle", bool(aligned and decisive),
-                              f"last closed 5m {'up' if trigger.close > trigger.open else 'down' if trigger.close < trigger.open else 'flat'}, "
-                              f"body {body_fraction * 100:.0f}% of range (min {MIN_BODY_FRACTION * 100:.0f}%)"))
+            dir_word = "up" if trigger.close > trigger.open else "down" if trigger.close < trigger.open else "flat"
+            dir_word_ar = "صاعدة" if trigger.close > trigger.open else "هابطة" if trigger.close < trigger.open else "مسطحة"
+            gates.append(_gate("trigger-candle", bool(aligned and decisive),
+                               f"last closed 5m {dir_word}, body {body_fraction * 100:.0f}% of range (min {MIN_BODY_FRACTION * 100:.0f}%)",
+                               f"آخر شمعة 5m {dir_word_ar}، الجسم {body_fraction * 100:.0f}% من المدى (الحد {MIN_BODY_FRACTION * 100:.0f}%)"))
             atr = max(view_5m.atr14, 1e-12)
             spike = candle_range > atr * MAX_RANGE_ATR_MULTIPLE
-            gates.append(Gate("no-spike", not spike,
-                              f"trigger range {candle_range:g} vs ATR {view_5m.atr14:g}" + (" — spike, stand aside" if spike else "")))
+            gates.append(_gate("no-spike", not spike,
+                               f"trigger range {candle_range:g} vs ATR {view_5m.atr14:g}" + (" — spike, stand aside" if spike else ""),
+                               f"مدى الشمعة {candle_range:g} مقابل ATR {view_5m.atr14:g}" + (" — سبايك، يُمنع الدخول" if spike else "")))
             sma_ok = (trigger.close > view_5m.sma20) if direction == "CALL" else (trigger.close < view_5m.sma20)
-            gates.append(Gate("price-vs-sma20", bool(sma_ok),
-                              f"close {trigger.close:g} vs 5m SMA20 {view_5m.sma20:g}"))
+            gates.append(_gate("price-vs-sma20", bool(sma_ok),
+                               f"close {trigger.close:g} vs 5m SMA20 {view_5m.sma20:g}",
+                               f"الإغلاق {trigger.close:g} مقابل SMA20 (5m) = {view_5m.sma20:g}"))
         else:
-            gates.append(Gate("trigger-candle", False, "skipped — earlier gate failed"))
-            gates.append(Gate("no-spike", False, "skipped — earlier gate failed"))
-            gates.append(Gate("price-vs-sma20", False, "skipped — earlier gate failed"))
+            skipped_ar = "تُخطيت — بوابة سابقة فشلت"
+            gates.append(_gate("trigger-candle", False, "skipped — earlier gate failed", skipped_ar))
+            gates.append(_gate("no-spike", False, "skipped — earlier gate failed", skipped_ar))
+            gates.append(_gate("price-vs-sma20", False, "skipped — earlier gate failed", skipped_ar))
 
     score = sum(1 for gate in gates if gate.passed)
     verdict = "WAIT"
@@ -303,6 +329,12 @@ def _entry_reason(verdict: str, gates: tuple[Gate, ...], lang: str) -> str:
     return " + ".join(parts)
 
 
+def _gate_detail(gate: Gate, lang: str) -> str:
+    if lang == "ar" and gate.detail_ar:
+        return gate.detail_ar
+    return gate.detail
+
+
 def render(verdict: BinaryVerdict, lang: str = "ar") -> str:
     name = verdict.asset_ar if lang == "ar" else verdict.asset_en
     strength = strength_for(verdict.score, verdict.verdict)
@@ -320,10 +352,10 @@ def render(verdict: BinaryVerdict, lang: str = "ar") -> str:
             lines.append(f"⏱️ المدة: {verdict.expiry_minutes} دقيقة")
         lines.append("")
         lines.append("✅ الشروط الناجحة:")
-        lines += [f"- {gate.name}: {gate.detail}" for gate in passed] or ["- (لا شيء)"]
+        lines += [f"- {gate.name}: {_gate_detail(gate, lang)}" for gate in passed] or ["- (لا شيء)"]
         if failed:
             lines.append("❌ الشروط الفاشلة:")
-            lines += [f"- {gate.name}: {gate.detail}" for gate in failed]
+            lines += [f"- {gate.name}: {_gate_detail(gate, lang)}" for gate in failed]
         lines.append("")
         reason = _wait_reason(verdict.gates, "ar") if verdict.verdict == "WAIT" else _entry_reason(verdict.verdict, verdict.gates, "ar")
         lines.append(f"🧠 السبب: {reason}")
@@ -349,10 +381,10 @@ def render(verdict: BinaryVerdict, lang: str = "ar") -> str:
         lines.append(f"⏱️ Suggested expiry: {verdict.expiry_minutes} minutes")
     lines.append("")
     lines.append("✅ Passed gates:")
-    lines += [f"- {gate.name}: {gate.detail}" for gate in passed] or ["- (none)"]
+    lines += [f"- {gate.name}: {_gate_detail(gate, lang)}" for gate in passed] or ["- (none)"]
     if failed:
         lines.append("❌ Failed gates:")
-        lines += [f"- {gate.name}: {gate.detail}" for gate in failed]
+        lines += [f"- {gate.name}: {_gate_detail(gate, lang)}" for gate in failed]
     lines.append("")
     reason = _wait_reason(verdict.gates, "en") if verdict.verdict == "WAIT" else _entry_reason(verdict.verdict, verdict.gates, "en")
     lines.append(f"🧠 Why: {reason}")
@@ -385,7 +417,7 @@ def to_dict(verdict: BinaryVerdict) -> dict:
         "rsi_5m": verdict.rsi_5m,
         "trend_15m": verdict.trend_15m,
         "trend_5m": verdict.trend_5m,
-        "gates": [{"name": gate.name, "passed": gate.passed, "detail": gate.detail} for gate in verdict.gates],
+        "gates": [{"name": gate.name, "passed": gate.passed, "detail": gate.detail, "detail_ar": gate.detail_ar} for gate in verdict.gates],
         "warnings": list(verdict.warnings),
         "source": verdict.source,
         "as_of": verdict.as_of,

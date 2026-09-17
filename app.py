@@ -37,7 +37,7 @@ from marketobserver.binary import decide as build_binary_verdict, render as rend
 from marketobserver.backtest import HistoryUnavailable, backtest as run_backtest, compare as compare_binary_modes, render as render_backtest, render_compare as render_binary_compare, to_dict as backtest_to_dict
 from marketobserver.research import MarketResearch, ResearchSnapshot, headline_age_hours, headline_fingerprint, headline_importance_level, is_fresh
 from marketobserver.risk import calculate_position_size
-from marketobserver.llm import GroundedLLM
+from marketobserver.llm import GroundedLLM, free_translate
 from marketobserver.smc import build_report as build_smc_report
 from marketobserver.smc_text import LANGS as SMC_LANGS, render as render_smc, render_brief as render_smc_brief, to_dict as smc_to_dict
 from marketobserver.decision import (
@@ -74,11 +74,15 @@ app = Flask(__name__)
 AR = {
     "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، سعر البيتكوين، ثنائي EURUSD، باك تست الذهب، ما أخبار التقويم اليوم؟ أو كم دقتك؟ الأوامر: /price و /assets و /binary و /backtest (اختبار الماضي) و /calendar و /stats و /capital و /analyze و /smc و /decision و /alert و /risk.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
-    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    # Admin-only commands are deliberately absent from this list so a regular
+    # user never sees /broadcast (it is appended separately for admins).
+    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell",
+    "admin_commands": " | أوامر المشرف: /broadcast",
 }
 
 EN = {
-    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell",
+    "admin_commands": " | Admin commands: /broadcast",
 }
 
 
@@ -535,14 +539,25 @@ def _news_time(published: str | None, lang: str, tz_name: str) -> str:
 
 @lru_cache(maxsize=256)
 def _translated_headline(headline: str, lang: str) -> str:
+    """Arabic users get Arabic headlines: LLM translation first, then the
+    keyless free fallback; only if both are unavailable the original title
+    is preserved (never a fabricated translation)."""
     if lang != "ar" or re.search(r"[\u0600-\u06ff]", headline or ""):
         return headline
     try:
         translated = llm.translate_headline(headline, "ar")
-        return translated[:220] if translated else headline
+        if translated:
+            return translated[:220]
     except Exception:
-        logger.warning("headline translation unavailable; preserving original title")
-        return headline
+        logger.info("LLM headline translation unavailable; trying keyless fallback")
+    try:
+        translated = free_translate(headline, "ar")
+        if translated:
+            return translated[:220]
+    except Exception:
+        pass
+    logger.warning("headline translation unavailable; preserving original title")
+    return headline
 
 
 def _news_guidance(sentiment: str, lang: str) -> tuple[str, str]:
@@ -728,7 +743,7 @@ def calendar_list_text(lang: str, tz_name: str, hours: int = 24) -> str:
         lines = ["📅 <b>التقويم الاقتصادي — 24 ساعة</b>", ""]
         for event in events[:15]:
             when = format_timestamp(event.event_time, lang, tz_name)
-            lines.append(f"{event.stars} <b>{html.escape(event.title)}</b> | {_country_label(event.country, lang)}")
+            lines.append(f"{event.stars} <b>{html.escape(_translated_headline(event.title, 'ar'))}</b> | {_country_label(event.country, lang)}")
             exp = f"متوقع {event.forecast} | سابق {event.previous}" if (event.forecast or event.previous) else "بدون توقع رقمي"
             lines.append(f"🕒 {html.escape(when)} | {_impact_label(event.impact, lang)} | {html.escape(exp)}")
             lines.append("")
@@ -901,11 +916,22 @@ def alert_cmd(message: types.Message):
         if not asset or target <= 0:
             raise ValueError
         db.add_alert(message.chat.id, asset.key, target, condition)
-        text = f"تم ضبط تنبيه {condition} لـ {asset.name_ar} عند {target}." if lang == "ar" else f"Alert set: {asset.key} {condition} {target}."
+        cond_ar = "فوق" if condition == "above" else "تحت"
+        text = f"تم ضبط تنبيه {cond_ar} سعر {asset.name_ar} عند {target}." if lang == "ar" else f"Alert set: {asset.key} {condition} {target}."
         bot.reply_to(message, text)
     except ValueError:
         bot.reply_to(message, "صيغة التنبيه أو السعر غير صحيح." if lang == "ar" else "Invalid alert format or price.")
 
+
+def _alert_condition_word(condition: str, lang: str) -> str:
+    if lang == "ar":
+        return "فوق" if condition == "above" else "تحت"
+    return condition
+
+def _alert_status_word(status: str, lang: str) -> str:
+    if lang != "ar":
+        return status
+    return {"active": "نشط", "triggered": "تم تفعيله", "cancelled": "ملغي"}.get(status, status)
 
 @bot.message_handler(commands=["alerts"])
 def alerts_cmd(message: types.Message):
@@ -914,7 +940,8 @@ def alerts_cmd(message: types.Message):
     if not alerts:
         bot.reply_to(message, "لا توجد تنبيهات." if lang == "ar" else "No alerts.")
         return
-    lines = [f"#{a.id} {a.asset_key} {a.condition} {a.target_price} — {a.status}" for a in alerts[:20]]
+    lines = [f"#{a.id} {a.asset_key} {a.target_price} — {_alert_condition_word(a.condition, lang)} | {_alert_status_word(a.status, lang)}"
+             for a in alerts[:20]]
     bot.reply_to(message, ("تنبيهاتك:\n" if lang == "ar" else "Your alerts:\n") + "\n".join(lines))
 
 
@@ -1043,35 +1070,9 @@ def smc_keyboard(asset_key: str, lang: str, mode: str) -> types.InlineKeyboardMa
         types.InlineKeyboardButton("📊 شارت موسوم" if lang == "ar" else "📊 Annotated chart", callback_data=f"smc:chart:{asset_key}:{lang}:{mode}"),
         types.InlineKeyboardButton("🔔 راقب المنطقة" if lang == "ar" else "🔔 Watch zone", callback_data=f"smc:alert:{asset_key}:{lang}:{mode}"),
     )
-    keyboard.add(types.InlineKeyboardButton("🧮 كيف قِستُ (BOS/CHoCH/OB/FVG)" if lang == "ar" else "🧮 How it is measured",
-                                            callback_data=f"smc:rules:{asset_key}:{lang}:{mode}"))
     return keyboard
 
 
-SMC_RULES_AR = (
-    "كيف تُكتَب النتائج (كل شيء حسابي، لا LLM):\n"
-    "• الهيكل: نقاط ارتكاز Fractal بنافذة شمعتين على كل جانب؛ الوسم لا يُعتمد إلا بعد إقفال الشمعتين التاليتين — لا استخدام لمستقبل البيانات.\n"
-    "• BOS: إغلاق جسم شمعة فوق آخر قمة مرتكز (للشراء) أو تحت آخر قاع (للبيع) مع كون الاتجاه على 4H في نفس الجهة.\n"
-    "• CHoCH: أول إغلاق معاكس للاتجاه السائد؛ يُستخدم كإنذار مبكر للانعكاس وليس كدخول.\n"
-    "• صيد السيولة: ذيل يخترق القمة/القاع ثم يعود الإغلاق للداخل — لا يُعامل ككسر أبدًا.\n"
-    "• OB: آخر شمعة معاكسة قبل حركة الإزاحة التي صنعت الكسر، وتبقى صالحة حتى إغلاق خلفها.\n"
-    "• FVG: فجوة ثلاث شموع بعرض ≥ 0.30 ATR؛ تُحسب نسبة التعبئة ولا تُقبل منطقة مُلأت ≥ 60%.\n"
-    "• الشموع: مطرقة/مقلوبتها/نجمة ساقطة = ذيل ≥ ضعفي الجسم؛ ابتلاعي = جسم يغلق فوق/تحت جسم السابقة مع كبره؛ نجمة صباح/مساء = ثلاث شموع بشروط وسطى صارمة؛ دوجي = جسم ≤ 10% من المدى. كل نمط يُذكر مع موضعه من المنطقة، لا منفردًا.\n"
-    "• الحجم: RVOL وارتفاعات ≥ 2.2x ونسبة الشراء العدواني من Binance (taker buy) وشكل OBV.\n"
-    "• القرار: كل البوابات (اتجاه 4H + تأكيد 15m + السعر داخل المنطقة + عدم المطاردة + إشارة شمعة + حجم + RR ≥ 1:2) يجب أن تنجح؛ وإلا WAIT."
-)
-SMC_RULES_EN = (
-    "How the numbers are produced (all arithmetic, no LLM):\n"
-    "• Structure: fractal pivots, 2 candles on each side; a pivot only counts after those two candles close — no look-ahead.\n"
-    "• BOS: a candle *body* closes above the last swing high (long) or below the last swing low (short) while the 4H bias agrees.\n"
-    "• CHoCH: first close against the prevailing bias — an early warning, not an entry.\n"
-    "• Liquidity sweep: a wick through the level with the close back inside — never counted as a break.\n"
-    "• OB: last opposing candle before the displacement leg that broke structure; valid until a close passes it.\n"
-    "• FVG: 3-candle gap at least 0.30 ATR wide; gaps filled ≥ 60% are rejected.\n"
-    "• Candles: hammer/inverted/shooting star need a wick ≥ 2x body; engulfing must close beyond the prior body; stars use strict three-candle rules; doji body ≤ 10% of range. Each print is reported with its location, never standalone.\n"
-    "• Volume: RVOL, spikes ≥ 2.2x, Binance taker buy share, OBV shape.\n"
-    "• Decision: every gate (4H trend, 15m confirmation, price in zone, no chasing, candle trigger, volume, RR ≥ 1:2) must pass — otherwise WAIT."
-)
 
 
 def deliver_smc(chat_id: int, text: str, markup=None, edit_message_id: int | None = None) -> None:
@@ -1200,10 +1201,6 @@ def smc_callback(call: types.CallbackQuery):
         if action == "asset":
             db.set_last_asset(call.message.chat.id, asset.key)
             smc_respond(call.message, asset, lang, mode)
-            bot.answer_callback_query(call.id)
-            return
-        if action == "rules":
-            deliver_smc(call.message.chat.id, SMC_RULES_AR if lang == "ar" else SMC_RULES_EN, smc_keyboard(asset.key, lang, mode))
             bot.answer_callback_query(call.id)
             return
         if action == "chart":
@@ -1899,8 +1896,16 @@ def text_cmd(message: types.Message):
     text = (message.text or "").strip()
     if text.startswith("/"):
         # Never swallow an unknown command silently; say it was not handled.
+        # Admin-only commands (/broadcast) are listed for admins only.
         lang = user_language(message)
-        bot.reply_to(message, AR["unknown_command"] if lang == "ar" else EN["unknown_command"])
+        base = AR["unknown_command"] if lang == "ar" else EN["unknown_command"]
+        extra = ""
+        try:
+            if is_admin_chat(message.chat.id):
+                extra = AR["admin_commands"] if lang == "ar" else EN["admin_commands"]
+        except Exception:
+            pass  # a lookup failure must not block the helpful reply
+        bot.reply_to(message, base + extra)
         return
     user = db.get_user(message.chat.id)
     request = parse_request(text, user.last_asset if user else None)
@@ -2153,7 +2158,10 @@ def calendar_pre_text(group, lang: str, tz_name: str) -> str:
 
 def calendar_release_text(group, prices: dict[str, float], lang: str) -> str:
     first = group[0]
-    titles = " + ".join(event.title for event in group[:3])
+    if lang == "ar":
+        titles = " + ".join(_translated_headline(event.title, "ar") for event in group[:3])
+    else:
+        titles = " + ".join(event.title for event in group[:3])
     if lang == "ar":
         lines = [
             f"{first.stars} <b>صدر الآن: {html.escape(titles)}</b>",
@@ -2221,7 +2229,10 @@ def event_trade_plan(asset: Asset, direction: str, capital: float, risk_pct: flo
 def calendar_followup_text(group, moves: list[tuple[str, float, float]], verdict_line: str,
                            plan_text: str | None, lang: str) -> str:
     first = group[0]
-    titles = " + ".join(event.title for event in group[:3])
+    if lang == "ar":
+        titles = " + ".join(_translated_headline(event.title, "ar") for event in group[:3])
+    else:
+        titles = " + ".join(event.title for event in group[:3])
     if lang == "ar":
         lines = [
             f"📊 <b>رد فعل السوق: {html.escape(titles)}</b>",
@@ -2360,6 +2371,7 @@ def scan_calendar(now_utc: datetime) -> None:
 
 def news_impact_text(asset: Asset, headline: str, move_pct: float, lang: str) -> str:
     name = asset.name_ar if lang == "ar" else asset.name_en
+    headline = _translated_headline(headline or "", lang)
     if lang == "ar":
         direction = "صاعد 📈" if move_pct > 0 else "هابط 📉"
         return (

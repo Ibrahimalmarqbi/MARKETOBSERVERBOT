@@ -167,10 +167,21 @@ def test_broadcast_command_requires_a_message_body(monkeypatch):
 def test_unknown_command_is_answered_not_ignored(monkeypatch):
     replies = []
     monkeypatch.setattr(app.bot, "reply_to", lambda message, text, **kwargs: replies.append(text))
+    app.db.upsert_user(555, None, "ar")
+    try:
+        app.text_cmd(Message("/nonexistent", chat_id=555))
 
-    app.text_cmd(Message("/nonexistent", chat_id=555))
+        assert replies and "/price" in replies[0]
+        # The admin-only /broadcast command must not be advertised to regular users.
+        assert "/broadcast" not in replies[0]
 
-    assert replies and "/broadcast" in replies[0]
+        # ...but an admin sees it appended to the same list.
+        app.db.set_user_role(555, "admin")
+        replies.clear()
+        app.text_cmd(Message("/nonexistent", chat_id=555))
+        assert replies and "/broadcast" in replies[0]
+    finally:
+        app.db.set_user_role(555, "user")
 
 
 def test_admin_broadcast_endpoint_requires_key_and_delivers(monkeypatch):

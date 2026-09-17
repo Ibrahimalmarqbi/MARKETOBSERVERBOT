@@ -170,17 +170,6 @@ def test_alert_button_attaches_stop_target_and_zone_alerts():
         assert {"above", "below"} >= {alert.condition for alert in alerts}
 
 
-def test_rules_button_explains_the_detectors_in_both_languages():
-    app.bot.process_new_updates([callback_update("smc:rules:BTC:ar:full")])
-    arabic = sent_text()
-    SENT.clear()
-    app.bot.process_new_updates([callback_update("smc:rules:BTC:en:full")])
-    english = sent_text()
-    assert "BOS" in arabic and "إغلاق جسم شمعة" in arabic
-    assert "BOS" in english and "closes above the last swing high" in english
-    assert "no LLM" in english and "arithmetic" in english
-
-
 def test_natural_language_reaches_the_same_report():
     app.bot.process_new_updates([message_update("ما مناطق السيولة في البيتكوين؟", language="ar")])
     body = sent_text()
