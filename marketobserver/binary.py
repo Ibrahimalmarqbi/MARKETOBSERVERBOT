@@ -4,9 +4,29 @@ from __future__ import annotations
 
 Binary options are decided by where the price is at expiry, minutes away, so
 this engine deliberately works on the 15m context and the 5m execution frame
-— not on 4H swing levels. Every gate is arithmetic on closed candles; a
-single failed gate produces WAIT with the failing reason, because on these
-timeframes noise dominates and most moments have no tradeable edge.
+— not on 4H swing levels. Every gate is arithmetic on closed candles; the
+engine never uses an LLM for the decision itself, because the same candles
+must always produce the same verdict (that is what makes the walk-forward
+backtest and the accuracy journal meaningful).
+
+Scoring model
+-------------
+The 8 gates are tiered instead of all equal:
+
+* VETO gates (safety): data-5m, data-15m, fresh-data, trend-agreement,
+  rsi-band, no-spike. A veto failure means WAIT no matter how many points
+  the rest collected — you cannot "buy" stale data, a sideways market, an
+  overbought snap-back or a news spike with extra points.
+* SCORED gates (quality): trigger-candle, price-vs-sma20. These sharpen the
+  conviction but do not block by themselves in ``scored`` mode.
+
+Entry modes
+-----------
+* ``strict`` (default): all 8 gates must pass (the original rule).
+* ``scored``: enter when every veto gate passes; the score is then 6-8/8 and
+  maps to MODERATE / STRONG / VERY STRONG. ``BINARY_ENTRY_MODE=scored``
+  switches the live engine, and the backtest measures the same mode so the
+  two can be compared on real history.
 
 The engine never promises a win rate. It only answers: "is momentum aligned
 enough on 15m+5m with a confirming candle to justify the next 10-15 minutes,
@@ -36,6 +56,25 @@ EXPIRY_MINUTES = 15
 # forex on weekends) or the feed is stale — deciding on it would be fiction.
 MAX_BAR_AGE = {"hours": 4}
 
+# Safety gates: any one failing forces WAIT, score irrelevant.
+VETO_GATES = ("data-5m", "data-15m", "fresh-data", "trend-agreement", "rsi-band", "no-spike")
+# Quality gates: each adds conviction to the score.
+SCORED_GATES = ("trigger-candle", "price-vs-sma20")
+ALL_GATES = VETO_GATES + SCORED_GATES
+TOTAL_SCORE = len(ALL_GATES)
+# Gates that must all pass in strict mode (the original all-or-nothing rule).
+DECISIVE_GATES = ("fresh-data", "trend-agreement", "rsi-band",
+                  "trigger-candle", "no-spike", "price-vs-sma20")
+
+STRENGTHS = {TOTAL_SCORE: "VERY STRONG", 7: "STRONG", 6: "MODERATE"}
+
+
+def strength_for(score: int, verdict: str) -> str:
+    """Grade the verdict by its score. WAIT is always WEAK context."""
+    if verdict == "WAIT":
+        return "WEAK"
+    return STRENGTHS.get(score, "WEAK")
+
 
 @dataclass(frozen=True)
 class Gate:
@@ -64,6 +103,8 @@ class BinaryVerdict:
     source: str = "unknown"
     as_of: str = ""
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    score: int = 0  # gates passed, out of TOTAL_SCORE
+    entry_mode: str = "strict"  # strict | scored
 
 
 def _trigger_candle(candles_5m: list[Candle]) -> Candle:
@@ -73,7 +114,7 @@ def _trigger_candle(candles_5m: list[Candle]) -> Candle:
 def decide(asset_key: str, asset_ar: str, asset_en: str, quote: str, decimals: int,
            candles_5m: list[Candle] | None, candles_15m: list[Candle] | None,
            source: str = "unknown", live_price: float | None = None,
-           now: datetime | None = None) -> BinaryVerdict:
+           now: datetime | None = None, strict: bool = True) -> BinaryVerdict:
     gates: list[Gate] = []
     warnings: list[str] = []
     moment = now or datetime.now(timezone.utc)
@@ -155,16 +196,23 @@ def decide(asset_key: str, asset_ar: str, asset_en: str, quote: str, decimals: i
             gates.append(Gate("no-spike", False, "skipped — earlier gate failed"))
             gates.append(Gate("price-vs-sma20", False, "skipped — earlier gate failed"))
 
+    score = sum(1 for gate in gates if gate.passed)
     verdict = "WAIT"
     confidence = "low"
     expiry = None
-    decisive_gates = [gate for gate in gates if gate.name in
-                      {"fresh-data", "trend-agreement", "rsi-band", "trigger-candle", "no-spike", "price-vs-sma20"}]
-    if direction and decisive_gates and all(gate.passed for gate in decisive_gates):
-        verdict = direction
-        expiry = EXPIRY_MINUTES
-        rsi_mid = abs((view_5m.rsi if view_5m else 50) - 50)
-        confidence = "high" if rsi_mid >= 8 else "medium"
+    entry_mode = "strict" if strict else "scored"
+    if direction:
+        if strict:
+            decisive = [gate for gate in gates if gate.name in DECISIVE_GATES]
+            enter = bool(decisive) and all(gate.passed for gate in decisive)
+        else:
+            vetoes = [gate for gate in gates if gate.name in VETO_GATES]
+            enter = bool(vetoes) and all(gate.passed for gate in vetoes)
+        if enter:
+            verdict = direction
+            expiry = EXPIRY_MINUTES
+            rsi_mid = abs((view_5m.rsi if view_5m else 50) - 50)
+            confidence = "high" if rsi_mid >= 8 else "medium"
 
     return BinaryVerdict(
         asset_key=asset_key, asset_ar=asset_ar, asset_en=asset_en, quote=quote,
@@ -175,62 +223,148 @@ def decide(asset_key: str, asset_ar: str, asset_en: str, quote: str, decimals: i
         trend_15m=view_15m.trend if view_15m else None,
         trend_5m=view_5m.trend if view_5m else None,
         gates=tuple(gates), source=source, as_of=as_of, warnings=tuple(warnings),
+        score=score, entry_mode=entry_mode,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Human-readable report (the "scoring" display: X/8, strength, ✅/❌, reason).
+# Pure text over the computed verdict — no LLM involved.
+# --------------------------------------------------------------------------- #
+
+_TREND_AR = {"bullish": "صاعد", "bearish": "هابط", "sideways": "عرضي"}
+_TREND_EN = {"bullish": "up", "bearish": "down", "sideways": "sideways"}
+
+_WAIT_REASON_AR = {
+    "data-5m": "بيانات 5m غير كافية (أقل من 50 شمعة)",
+    "data-15m": "بيانات 15m غير كافية (أقل من 50 شمعة)",
+    "fresh-data": "البيانات قديمة — السوق مغلق أو المزود متعطل",
+    "trend-agreement": "الاتجاه غير متفق بين الفريمين (sideways = لا دخول)",
+    "rsi-band": "RSI خارج النطاق الآمن (تشبع → احتمال ارتداد)",
+    "trigger-candle": "لا توجد شمعة تأكيد بجسم حاسم",
+    "no-spike": "شمعة سبايك (خبر متفجر) — الدخول وقتها أسوأ صفقة",
+    "price-vs-sma20": "السعر في الجهة الخاطئة من SMA20",
+    "indicators": "تعذر حساب المؤشرات",
+}
+_WAIT_REASON_EN = {
+    "data-5m": "not enough 5m data (fewer than 50 candles)",
+    "data-15m": "not enough 15m data (fewer than 50 candles)",
+    "fresh-data": "stale data — market closed or feed down",
+    "trend-agreement": "frames disagree (sideways = no entry)",
+    "rsi-band": "RSI outside the safe band (overbought → snap-back risk)",
+    "trigger-candle": "no decisive trigger candle",
+    "no-spike": "news-spike candle — entering now is the worst trade",
+    "price-vs-sma20": "price on the wrong side of SMA20",
+    "indicators": "could not compute indicators",
+}
+
+
+def _trend_line(trend_15m: str | None, trend_5m: str | None, lang: str) -> str:
+    table = _TREND_AR if lang == "ar" else _TREND_EN
+    if not trend_15m and not trend_5m:
+        return "غير محدد — بيانات ناقصة" if lang == "ar" else "unknown — missing data"
+    if trend_15m == trend_5m:
+        extra = " — متفق على الفريمين (15m+5m)" if lang == "ar" else " — frames agree (15m+5m)"
+        return f"{table.get(trend_15m, trend_15m)}{extra}"
+    if lang == "ar":
+        return f"غير متفق: 15m {table.get(trend_15m, trend_15m)} | 5m {table.get(trend_5m, trend_5m)}"
+    return f"disagree: 15m {table.get(trend_15m, trend_15m)} | 5m {table.get(trend_5m, trend_5m)}"
+
+
+def _wait_reason(gates: tuple[Gate, ...], lang: str) -> str:
+    table = _WAIT_REASON_AR if lang == "ar" else _WAIT_REASON_EN
+    order = {name: index for index, name in enumerate(ALL_GATES)}
+    failed = [gate for gate in gates if not gate.passed]
+    if not failed:
+        return "انتظار احترازي" if lang == "ar" else "cautious wait"
+    failed.sort(key=lambda gate: order.get(gate.name, 99))
+    return table.get(failed[0].name, failed[0].detail)
+
+
+def _entry_reason(verdict: str, gates: tuple[Gate, ...], lang: str) -> str:
+    passed = {gate.name for gate in gates if gate.passed}
+    up = verdict == "CALL"
+    if lang == "ar":
+        parts = [
+            f"اتجاه {'صاعد' if up else 'هابط'} متفق على الفريمين",
+            "RSI ضمن النطاق الآمن",
+            "شمعة تأكيد حاسمة" if "trigger-candle" in passed else "بلا شمعة تأكيد (تأكيد أضعف)",
+            ("السعر فوق SMA20" if up else "السعر تحت SMA20") if "price-vs-sma20" in passed
+            else "لكن السعر بعيد عن SMA20",
+        ]
+    else:
+        parts = [
+            f"trending {'up' if up else 'down'} on both frames",
+            "RSI inside the safe band",
+            "decisive trigger candle" if "trigger-candle" in passed else "no decisive trigger (weaker confirmation)",
+            ("price above SMA20" if up else "price below SMA20") if "price-vs-sma20" in passed
+            else "but price is away from SMA20",
+        ]
+    return " + ".join(parts)
 
 
 def render(verdict: BinaryVerdict, lang: str = "ar") -> str:
     name = verdict.asset_ar if lang == "ar" else verdict.asset_en
+    strength = strength_for(verdict.score, verdict.verdict)
+    passed = [gate for gate in verdict.gates if gate.passed]
+    failed = [gate for gate in verdict.gates if not gate.passed]
+
     if lang == "ar":
-        label = {"CALL": "🟢 صعود CALL", "PUT": "🔴 هبوط PUT", "WAIT": "⏸️ انتظار WAIT"}[verdict.verdict]
-        lines = [f"{label} | {name} ({verdict.asset_key})", ""]
+        label = {"CALL": "🟢 CALL", "PUT": "🔴 PUT", "WAIT": "⏸️ WAIT"}[verdict.verdict]
+        lines = [f"📊 {name} ({verdict.asset_key}) Analysis", ""]
+        lines.append(f"🎯 القرار: {label}")
+        lines.append(f"📈 الاتجاه: {_trend_line(verdict.trend_15m, verdict.trend_5m, 'ar')}")
+        lines.append(f"⭐ القوة: {strength}")
+        lines.append(f"📊 النقاط: {verdict.score} / {TOTAL_SCORE}")
         if verdict.verdict != "WAIT":
-            lines.append(f"⏱ انتهاء الصلاحية المقترح: {verdict.expiry_minutes} دقيقة")
-            lines.append(f"🎯 الثقة: {'مرتفعة' if verdict.confidence == 'high' else 'متوسطة'}")
-        else:
-            failed = next((gate for gate in verdict.gates if not gate.passed), None)
-            lines.append("لا توجد محفزات كافية الآن — الانتظار هو القرار المهني.")
-            if failed:
-                lines.append(f"⛔ سبب الانتظار: {failed.detail}")
+            lines.append(f"⏱️ المدة: {verdict.expiry_minutes} دقيقة")
+        lines.append("")
+        lines.append("✅ الشروط الناجحة:")
+        lines += [f"- {gate.name}: {gate.detail}" for gate in passed] or ["- (لا شيء)"]
+        if failed:
+            lines.append("❌ الشروط الفاشلة:")
+            lines += [f"- {gate.name}: {gate.detail}" for gate in failed]
+        lines.append("")
+        reason = _wait_reason(verdict.gates, "ar") if verdict.verdict == "WAIT" else _entry_reason(verdict.verdict, verdict.gates, "ar")
+        lines.append(f"🧠 السبب: {reason}")
         if verdict.reference_price is not None:
             extra = f" | لحظي {verdict.live_price}" if verdict.live_price else ""
             lines.append(f"💰 السعر المرجعي (إغلاق 5m): {verdict.reference_price} {verdict.quote}{extra}")
         if verdict.rsi_15m is not None:
-            lines.append(f"📊 RSI: فريم 15m = {verdict.rsi_15m} | فريم 5m = {verdict.rsi_5m}")
-        if verdict.trend_15m:
-            lines.append(f"📈 الاتجاه: 15m = {verdict.trend_15m} | 5m = {verdict.trend_5m}")
+            lines.append(f"📊 RSI: 15m = {verdict.rsi_15m} | 5m = {verdict.rsi_5m}")
         lines.append("")
-        lines.append("البوابات:")
-        for gate in verdict.gates:
-            lines.append(f"{'✅' if gate.passed else '❌'} {gate.name}: {gate.detail}")
+        lines.append(f"المصدر: {verdict.source} | الوضع: {verdict.entry_mode}")
         for warning in verdict.warnings:
             lines.append(f"⚠️ {warning}")
-        lines.append(f"المصدر: {verdict.source}")
         lines.append("⚠️ التداول الثنائي عالي الخطورة وقد تخسر كامل مبلغ الصفقة. هذه قراءة آلية وليست ضمانًا للربح — جرّب على التجريبي أولًا.")
         return "\n".join(lines)
+
     label = {"CALL": "🟢 CALL (up)", "PUT": "🔴 PUT (down)", "WAIT": "⏸️ WAIT"}[verdict.verdict]
-    lines = [f"{label} | {name} ({verdict.asset_key})", ""]
+    lines = [f"📊 {name} ({verdict.asset_key}) Analysis", ""]
+    lines.append(f"🎯 Verdict: {label}")
+    lines.append(f"📈 Trend: {_trend_line(verdict.trend_15m, verdict.trend_5m, 'en')}")
+    lines.append(f"⭐ Strength: {strength}")
+    lines.append(f"📊 Score: {verdict.score} / {TOTAL_SCORE}")
     if verdict.verdict != "WAIT":
-        lines.append(f"⏱ Suggested expiry: {verdict.expiry_minutes} minutes")
-        lines.append(f"🎯 Confidence: {verdict.confidence}")
-    else:
-        failed = next((gate for gate in verdict.gates if not gate.passed), None)
-        lines.append("No sufficient edge right now — waiting is the professional call.")
-        if failed:
-            lines.append(f"⛔ Wait reason: {failed.detail}")
+        lines.append(f"⏱️ Suggested expiry: {verdict.expiry_minutes} minutes")
+    lines.append("")
+    lines.append("✅ Passed gates:")
+    lines += [f"- {gate.name}: {gate.detail}" for gate in passed] or ["- (none)"]
+    if failed:
+        lines.append("❌ Failed gates:")
+        lines += [f"- {gate.name}: {gate.detail}" for gate in failed]
+    lines.append("")
+    reason = _wait_reason(verdict.gates, "en") if verdict.verdict == "WAIT" else _entry_reason(verdict.verdict, verdict.gates, "en")
+    lines.append(f"🧠 Why: {reason}")
     if verdict.reference_price is not None:
         extra = f" | live {verdict.live_price}" if verdict.live_price else ""
         lines.append(f"💰 Reference price (5m close): {verdict.reference_price} {verdict.quote}{extra}")
     if verdict.rsi_15m is not None:
         lines.append(f"📊 RSI: 15m = {verdict.rsi_15m} | 5m = {verdict.rsi_5m}")
-    if verdict.trend_15m:
-        lines.append(f"📈 Trend: 15m = {verdict.trend_15m} | 5m = {verdict.trend_5m}")
     lines.append("")
-    lines.append("Gates:")
-    for gate in verdict.gates:
-        lines.append(f"{'✅' if gate.passed else '❌'} {gate.name}: {gate.detail}")
+    lines.append(f"Source: {verdict.source} | mode: {verdict.entry_mode}")
     for warning in verdict.warnings:
         lines.append(f"⚠️ {warning}")
-    lines.append(f"Source: {verdict.source}")
     lines.append("⚠️ Binary trading is high-risk; you can lose the full stake. This is automated analysis, not a profit guarantee — practice on demo first.")
     return "\n".join(lines)
 
@@ -240,6 +374,10 @@ def to_dict(verdict: BinaryVerdict) -> dict:
         "asset": verdict.asset_key,
         "verdict": verdict.verdict,
         "confidence": verdict.confidence,
+        "strength": strength_for(verdict.score, verdict.verdict),
+        "score": verdict.score,
+        "score_total": TOTAL_SCORE,
+        "entry_mode": verdict.entry_mode,
         "expiry_minutes": verdict.expiry_minutes,
         "reference_price": verdict.reference_price,
         "live_price": verdict.live_price,

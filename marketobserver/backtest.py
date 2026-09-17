@@ -70,6 +70,7 @@ class BacktestResult:
     data_to: str = ""
     source: str = "unknown"
     monthly: tuple[tuple[str, int, int, float], ...] = ()  # (YYYY-MM, trades, wins, net)
+    entry_mode: str = "strict"  # strict (8/8) | scored (all 6 safety gates, enter >= 6/8)
 
     @property
     def decided(self) -> int:
@@ -186,8 +187,13 @@ def _fetch_yahoo_5m(asset: Asset, days: int) -> tuple[list[Candle], str]:
     return sorted(candles, key=lambda item: item.timestamp), f"yahoo:{asset.provider_symbol}"
 
 
-def run(candles_5m: list[Candle], asset: Asset, payout: float = DEFAULT_PAYOUT) -> BacktestResult:
-    """Walk-forward simulation. Pure function: no network, fully testable."""
+def run(candles_5m: list[Candle], asset: Asset, payout: float = DEFAULT_PAYOUT,
+        strict: bool = True) -> BacktestResult:
+    """Walk-forward simulation. Pure function: no network, fully testable.
+
+    ``strict`` must match the live engine's entry mode (see binary.decide),
+    otherwise the backtest measures a different strategy than the one traded.
+    """
     bars_15m = to_15m(candles_5m)
     pointer = 0
     trades: list[TradeResult] = []
@@ -200,7 +206,8 @@ def run(candles_5m: list[Candle], asset: Asset, payout: float = DEFAULT_PAYOUT) 
             continue
         window_5m = candles_5m[max(0, index - WINDOW + 1):index + 1]
         verdict = decide(asset.key, asset.name_ar, asset.name_en, asset.quote,
-                         asset.price_decimals, window_5m, window_15m, "backtest", now=moment)
+                         asset.price_decimals, window_5m, window_15m, "backtest", now=moment,
+                         strict=strict)
         if verdict.verdict not in {"CALL", "PUT"}:
             continue
         ref = candles_5m[index].close
@@ -233,19 +240,21 @@ def run(candles_5m: list[Candle], asset: Asset, payout: float = DEFAULT_PAYOUT) 
         data_from=candles_5m[0].timestamp.isoformat() if candles_5m else "",
         data_to=candles_5m[-1].timestamp.isoformat() if candles_5m else "",
         monthly=monthly,
+        entry_mode="strict" if strict else "scored",
     )
 
 
 def backtest(asset: Asset, days: int = 30, payout: float = DEFAULT_PAYOUT,
-             session: requests.Session | None = None) -> BacktestResult:
+             session: requests.Session | None = None, strict: bool = True) -> BacktestResult:
     candles, source = fetch_5m(asset, days, session)
-    result = run(candles, asset, payout)
+    result = run(candles, asset, payout, strict=strict)
     return BacktestResult(
         asset_key=result.asset_key, asset_ar=result.asset_ar, asset_en=result.asset_en,
         days=result.days, bars_5m=result.bars_5m, payout=result.payout, trades=result.trades,
         wins=result.wins, losses=result.losses, flats=result.flats, net_units=result.net_units,
         max_losing_streak=result.max_losing_streak, data_from=result.data_from,
         data_to=result.data_to, source=source, monthly=result.monthly,
+        entry_mode=result.entry_mode,
     )
 
 
@@ -256,9 +265,12 @@ def render(result: BacktestResult, lang: str = "ar") -> str:
         else f"❌ خاسر على هذه الفترة ({result.net_units} وحدة)" if result.net_units < 0
         else "⚪ متعادل على هذه الفترة (0)")
     if lang == "ar":
+        mode_ar = ("strict — كل البوابات الثمانية إلزامية" if result.entry_mode == "strict"
+                   else "scored — الدخول إذا نجحت بوابات السلامة الست (≥ 6/8)")
         lines = [
             f"🧪 <b>باك تست الثنائي | {name} ({result.asset_key})</b>",
             f"الفترة: ~{result.days} يوم | الشموع: {result.bars_5m} (5m) | المصدر: {result.source}",
+            f"وضع الدخول: {mode_ar}",
             f"العائد المفترض: {result.payout:.0%} | نقطة التعادل: دقة {result.breakeven_rate:.0%}",
             "",
             f"القرارات: {len(result.trades)} | ✅ {result.wins} | ❌ {result.losses} | ⚪ {result.flats}",
@@ -278,9 +290,12 @@ def render(result: BacktestResult, lang: str = "ar") -> str:
         f"✅ Profitable on this window (+{result.net_units} units)" if result.net_units > 0
         else f"❌ Losing on this window ({result.net_units} units)" if result.net_units < 0
         else "⚪ Flat on this window (0)")
+    mode_en = ("strict — all 8 gates required" if result.entry_mode == "strict"
+               else "scored — enter when all 6 safety gates pass (>= 6/8)")
     lines = [
         f"🧪 <b>Binary backtest | {name} ({result.asset_key})</b>",
         f"Window: ~{result.days}d | bars: {result.bars_5m} (5m) | source: {result.source}",
+        f"Entry mode: {mode_en}",
         f"Assumed payout: {result.payout:.0%} | breakeven: {result.breakeven_rate:.0%} win rate",
         "",
         f"Signals: {len(result.trades)} | ✅ {result.wins} | ❌ {result.losses} | ⚪ {result.flats}",
@@ -316,6 +331,7 @@ def to_dict(result: BacktestResult) -> dict:
         "data_from": result.data_from,
         "data_to": result.data_to,
         "source": result.source,
+        "entry_mode": result.entry_mode,
         "monthly": [{"month": month, "signals": count, "wins": won, "net": net}
                     for month, count, won, net in result.monthly],
     }

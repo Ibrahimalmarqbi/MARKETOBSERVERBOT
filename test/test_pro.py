@@ -219,6 +219,58 @@ def test_binary_waits_on_stale_bars_like_a_closed_market():
     assert any(gate.name == "fresh-data" and not gate.passed for gate in verdict.gates)
 
 
+def _doji_5m(candles: list[Candle]) -> list[Candle]:
+    """Rewrite the last 5m candle as a doji (zero body) — same close/HL, so
+    RSI/SMA/ATR are untouched and only the trigger gate loses conviction."""
+    last = candles[-1]
+    doji = Candle(last.timestamp, last.close, last.high, last.low, last.close, last.volume)
+    return candles[:-1] + [doji]
+
+
+def test_scored_mode_enters_on_seven_eights_with_weak_trigger():
+    up_5m = trend_candles(1.0800, 0.0002)
+    up_15m = trend_candles(1.0780, 0.0004)
+    weak = _doji_5m(up_5m)
+    scored = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5, weak, up_15m, "unit-test", strict=False)
+    assert scored.verdict == "CALL"
+    assert scored.expiry_minutes == 15
+    assert scored.score == 7 and scored.entry_mode == "scored"
+    assert to_dict(scored)["strength"] == "STRONG"  # strength is derived from the score
+    assert any(gate.name == "trigger-candle" and not gate.passed for gate in scored.gates)
+    # ...while strict mode (default) stays closed on the same candles.
+    strict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5, weak, up_15m, "unit-test")
+    assert strict.verdict == "WAIT"
+    assert strict.entry_mode == "strict"
+
+
+def test_scored_mode_never_buys_stale_data_with_points():
+    up_5m = trend_candles(1.0800, 0.0002)
+    up_15m = trend_candles(1.0780, 0.0004)
+    verdict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5, up_5m, up_15m, "unit-test",
+                     now=datetime.now(timezone.utc) + timedelta(days=2), strict=False)
+    # Fresh-data is a veto: no amount of points on the rest may open a trade
+    # on a closed market or a dead feed.
+    assert verdict.verdict == "WAIT"
+    assert verdict.score < 6
+    assert to_dict(verdict)["strength"] == "WEAK"
+    assert to_dict(verdict)["entry_mode"] == "scored"
+
+
+def test_render_shows_score_strength_and_reason():
+    up_5m = trend_candles(1.0800, 0.0002)
+    up_15m = trend_candles(1.0780, 0.0004)
+    verdict = decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5, up_5m, up_15m, "unit-test")
+    text = render(verdict, "ar")
+    assert "8 / 8" in text and "VERY STRONG" in text
+    assert "🎯 القرار: 🟢 CALL" in text
+    assert "🧠 السبب:" in text and "✅ الشروط الناجحة:" in text
+    assert "❌" not in text  # every gate passed
+    wait_text = render(decide("EURUSD", "اليورو/الدولار", "EUR/USD", "USD", 5,
+                              trend_candles(1.0900, -0.0002), trend_candles(1.0780, 0.0004),
+                              "unit-test"), "en")
+    assert "Score: " in wait_text and "WEAK" in wait_text and "Why:" in wait_text
+
+
 # ---------------- NLP ----------------
 
 def test_price_and_binary_intents_are_multilingual():

@@ -4,6 +4,7 @@ import html
 import io
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -797,7 +798,7 @@ def backtest_cmd(message: types.Message):
     bot.reply_to(message, f"🧪 أختبر {asset.key} على ~{days} يومًا... قد يستغرق هذا دقيقة." if lang == "ar" else f"🧪 Backtesting {asset.key} on ~{days} days... this can take a minute.")
     try:
         bot.send_chat_action(message.chat.id, "typing")
-        result = run_backtest(asset, days)
+        result = run_backtest(asset, days, strict=BINARY_STRICT)
         bot.send_message(message.chat.id, render_backtest(result, lang), parse_mode="HTML", disable_web_page_preview=True)
     except HistoryUnavailable:
         bot.reply_to(message, AR["data_error"] if lang == "ar" else "Not enough historical data for this backtest.")
@@ -1388,6 +1389,14 @@ def decision_callback(call: types.CallbackQuery):
 BINARY_TIMEFRAMES = ("5m", "15m")
 BINARY_TTL_SECONDS = 30
 binary_cache: dict[str, tuple[float, object]] = {}
+# Entry mode: "strict" (default) requires all 8 gates — the original rule.
+# "scored" enters when the 6 safety (veto) gates pass, i.e. score >= 6/8, and
+# grades strength from the score. The backtest always measures the SAME mode
+# so /backtest compares the strategy you actually run.
+BINARY_ENTRY_MODE = os.getenv("BINARY_ENTRY_MODE", "strict").strip().lower()
+if BINARY_ENTRY_MODE not in {"strict", "scored"}:
+    BINARY_ENTRY_MODE = "strict"
+BINARY_STRICT = BINARY_ENTRY_MODE != "scored"
 
 
 def binary_verdict_for(asset: Asset, force: bool = False):
@@ -1408,7 +1417,8 @@ def binary_verdict_for(asset: Asset, force: bool = False):
         live_price = None
     verdict = build_binary_verdict(asset.key, asset.name_ar, asset.name_en, asset.quote,
                                    asset.price_decimals, candles["5m"], candles["15m"],
-                                   market.last_source(asset.key) or "unknown", live_price)
+                                   market.last_source(asset.key) or "unknown", live_price,
+                                   strict=BINARY_STRICT)
     binary_cache[asset.key] = (time.time(), verdict)
     return verdict
 
@@ -1455,7 +1465,7 @@ def binary_respond(target_message, asset: Asset, lang: str, force: bool = False,
             try:
                 db.journal_add("binary", asset.key, verdict.verdict, ref,
                                verdict.expiry_minutes or 15, chat_id=target_message.chat.id,
-                               note=f"conf:{verdict.confidence}")
+                               note=f"mode:{verdict.entry_mode} conf:{verdict.confidence} score:{verdict.score}/8")
             except Exception:
                 logger.exception("binary journal failed")
         calibration = calibration_for(db, asset.key, verdict.verdict)
@@ -2529,7 +2539,7 @@ def backtest_endpoint(asset_key: str):
     if lang not in {"ar", "en"}:
         return jsonify({"error": "lang must be ar or en"}), 400
     try:
-        result = run_backtest(asset, days, payout)
+        result = run_backtest(asset, days, payout, strict=BINARY_STRICT)
     except HistoryUnavailable:
         return jsonify({"error": "not enough historical data", "asset": asset.key}), 503
     payload = backtest_to_dict(result)

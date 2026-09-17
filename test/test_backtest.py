@@ -148,7 +148,7 @@ def test_endpoint_and_nl_intent(monkeypatch):
     assert parse_request("backtest BTC").intent == "backtest"
 
     result = run(wave(), ASSETS["EURUSD"])
-    monkeypatch.setattr(app, "run_backtest", lambda asset, days=30, payout=0.8: result)
+    monkeypatch.setattr(app, "run_backtest", lambda asset, days=30, payout=0.8, strict=True: result)
     client = app.app.test_client()
     response = client.get("/backtest/EURUSD?days=30&lang=en")
     assert response.status_code == 200
@@ -185,7 +185,7 @@ def message_update(text, chat_id=4242, language="ar"):
 
 def test_backtest_command_end_to_end(telegram, monkeypatch):
     result = run(wave(), ASSETS["EURUSD"])
-    monkeypatch.setattr(app, "run_backtest", lambda asset, days=30, payout=0.8: result)
+    monkeypatch.setattr(app, "run_backtest", lambda asset, days=30, payout=0.8, strict=True: result)
     app.bot.process_new_updates([message_update("/backtest EURUSD 30")])
     assert len(SENT) == 2  # progress note + report
     assert "باك تست" in SENT[-1] and "EURUSD" in SENT[-1]
