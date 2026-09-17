@@ -18,7 +18,7 @@ A green backtest still proves nothing about the future — it only answers:
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -256,6 +256,77 @@ def backtest(asset: Asset, days: int = 30, payout: float = DEFAULT_PAYOUT,
         data_to=result.data_to, source=source, monthly=result.monthly,
         entry_mode=result.entry_mode,
     )
+
+
+def run_compare(candles_5m: list[Candle], asset: Asset,
+                payout: float = DEFAULT_PAYOUT) -> tuple[BacktestResult, BacktestResult]:
+    """Same history, both entry modes. Pure function: no network."""
+    strict = run(candles_5m, asset, payout, strict=True)
+    scored = run(candles_5m, asset, payout, strict=False)
+    return strict, scored
+
+
+def compare(asset: Asset, days: int = 30, payout: float = DEFAULT_PAYOUT,
+            session: requests.Session | None = None) -> tuple[BacktestResult, BacktestResult]:
+    """Fetch the history ONCE and measure both modes on it, so the comparison
+    is exact: the only variable between the two results is the entry rule."""
+    candles, source = fetch_5m(asset, days, session)
+    strict, scored = run_compare(candles, asset, payout)
+    return replace(strict, source=source), replace(scored, source=source)
+
+
+def render_compare(strict_res: BacktestResult, scored_res: BacktestResult, lang: str = "ar") -> str:
+    name = strict_res.asset_ar if lang == "ar" else strict_res.asset_en
+    breakeven = round(1 / (1 + strict_res.payout), 3) if strict_res.payout else 0.556
+
+    if strict_res.decided == 0 and scored_res.decided == 0:
+        verdict_line = ("⚪ لا قرارات في الوضعين على هذه الفترة." if lang == "ar"
+                        else "No signals in either mode on this window.")
+        winner = ""
+    else:
+        diff = scored_res.net_units - strict_res.net_units
+        if abs(diff) < 0.05:
+            verdict_line = ("تعادل فعلي على هذه الفترة — الفرق في الدقة لا يغطي الفرق في عدد الصفقات."
+                            if lang == "ar" else "Effectively a tie on this window.")
+            winner = ""
+        elif diff > 0:
+            verdict_line = ("📌 على هذه الفترة: **scored** أوفر (صفقات أكثر بسعر أفضل)."
+                            if lang == "ar" else "📌 On this window: **scored** nets more (more trades at the same edge).")
+            winner = "scored"
+        else:
+            verdict_line = ("📌 على هذه الفترة: **strict** أوفر (التقيّد الكامل كان أدق)."
+                            if lang == "ar" else "📌 On this window: **strict** nets more (all-or-nothing was more precise).")
+            winner = "strict"
+
+    if lang == "ar":
+        lines = [
+            f"⚖️ <b>مقارنة وضعي الدخول | {name} ({strict_res.asset_key})</b>",
+            f"الفترة: ~{strict_res.days} يوم | الشموع: {strict_res.bars_5m} (5m) | المصدر: {strict_res.source}",
+            f"العائد المفترض: {strict_res.payout:.0%} | نقطة التعادل: دقة {breakeven:.0%}",
+            "",
+            "الوضع | قرارات | دقة | صافي | أطول سلسلة",
+            f"🔒 strict | {strict_res.decided} | {strict_res.win_rate if strict_res.decided else 0:.0%} | {strict_res.net_units:+.1f} | {strict_res.max_losing_streak}",
+            f"📊 scored | {scored_res.decided} | {scored_res.win_rate if scored_res.decided else 0:.0%} | {scored_res.net_units:+.1f} | {scored_res.max_losing_streak}",
+            "",
+            verdict_line,
+            "⚠️ هذا قياس على ماضٍ محدود: السبريد والانزلاق وعائد الوسيط الحقيقي قد تقلب النتيجة. "
+            "قارن على أكثر من أصل قبل أي تبديل.",
+        ]
+        return "\n".join(lines)
+    lines = [
+        f"⚖️ <b>Entry-mode comparison | {name} ({strict_res.asset_key})</b>",
+        f"Window: ~{strict_res.days}d | bars: {strict_res.bars_5m} (5m) | source: {strict_res.source}",
+        f"Assumed payout: {strict_res.payout:.0%} | breakeven: {breakeven:.0%} win rate",
+        "",
+        "Mode | Signals | Win rate | Net | Longest streak",
+        f"🔒 strict | {strict_res.decided} | {strict_res.win_rate if strict_res.decided else 0:.0%} | {strict_res.net_units:+.1f} | {strict_res.max_losing_streak}",
+        f"📊 scored | {scored_res.decided} | {scored_res.win_rate if scored_res.decided else 0:.0%} | {scored_res.net_units:+.1f} | {scored_res.max_losing_streak}",
+        "",
+        verdict_line,
+        "⚠️ Bounded past measurement: spread, slippage and your real payout may flip the result. "
+        "Compare across several assets before switching.",
+    ]
+    return "\n".join(lines)
 
 
 def render(result: BacktestResult, lang: str = "ar") -> str:

@@ -8,7 +8,7 @@ import pytest
 import app
 from marketobserver.assets import ASSETS
 from marketobserver.backtest import (
-    HistoryUnavailable, backtest, render, run, to_15m, to_dict,
+    HistoryUnavailable, backtest, render, render_compare, run, run_compare, to_15m, to_dict,
 )
 from marketobserver.market_data import Candle
 
@@ -94,6 +94,44 @@ def test_losing_market_reports_honest_loss():
     assert "باك تست" in text and "التوقع/صفقة" in text
     assert "الماضي ليس ضمانًا" in text
     assert "profit" in render(result, "en").lower() or "win rate" in render(result, "en").lower()
+
+
+def test_compare_runs_both_modes_on_the_same_history():
+    strict, scored = run_compare(wave(), ASSETS["EURUSD"])
+    assert strict.entry_mode == "strict" and scored.entry_mode == "scored"
+    # Scored mode only ADDS lower-quality entries (all 6 safety gates), so
+    # every strict signal is also a scored signal on the same bars.
+    strict_times = {trade.time for trade in strict.trades}
+    scored_times = {trade.time for trade in scored.trades}
+    assert strict_times <= scored_times
+    text = render_compare(strict, scored, "ar")
+    assert "مقارنة" in text and "strict" in text and "scored" in text
+    assert "strict" in render_compare(strict, scored, "en")
+
+
+def test_backtest_both_command_renders_comparison(telegram, monkeypatch):
+    strict, scored = run_compare(wave(), ASSETS["EURUSD"])
+    monkeypatch.setattr(app, "compare_binary_modes",
+                        lambda asset, days=30, payout=0.8, session=None: (strict, scored))
+    app.bot.process_new_updates([message_update("/backtest EURUSD 30 both")])
+    assert SENT and "مقارنة" in SENT[-1] and "EURUSD" in SENT[-1]
+    # Arabic keywords work too.
+    SENT.clear()
+    app.bot.process_new_updates([message_update("/backtest EURUSD 30 مقارنة")])
+    assert SENT and "مقارنة" in SENT[-1]
+
+
+def test_backtest_endpoint_compare_mode(monkeypatch):
+    strict, scored = run_compare(wave(), ASSETS["EURUSD"])
+    monkeypatch.setattr(app, "compare_binary_modes",
+                        lambda asset, days=30, payout=0.8, session=None: (strict, scored))
+    client = app.app.test_client()
+    response = client.get("/backtest/EURUSD?days=30&compare=1")
+    assert response.status_code == 200
+    payload = response.json
+    assert payload["compare"]["strict"]["entry_mode"] == "strict"
+    assert payload["compare"]["scored"]["entry_mode"] == "scored"
+    assert "مقارنة" in payload["report"]
 
 
 def test_history_shortage_raises_clearly(monkeypatch):
