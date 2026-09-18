@@ -73,15 +73,74 @@ bot = telebot.TeleBot(settings.telegram_token, threaded=True)
 app = Flask(__name__)
 
 
+# ---------------- Telegram command menus (normal vs admin) ---------------- #
+# Normal users see only trading/analysis commands; admins see broadcast tools too.
+# Telegram lets us set a menu per chat (BotCommandScopeChat) and a default for
+# everyone else (BotCommandScopeAllPrivateChats). This is how you never forget
+# a command name: tap Menu → pick.
+NORMAL_COMMANDS = [
+    types.BotCommand("start", "البداية والأزرار / start and buttons"),
+    types.BotCommand("price", "سعر لحظي / live price"),
+    types.BotCommand("assets", "كتالوج الأصول / asset catalog"),
+    types.BotCommand("binary", "تداول ثنائي CALL/PUT / binary verdict"),
+    types.BotCommand("smc", "سيولة ذكية 4H/1H/15m / smart-money"),
+    types.BotCommand("decision", "قرار صارم / strict verdict"),
+    types.BotCommand("backtest", "اختبار الماضي / backtest"),
+    types.BotCommand("calendar", "التقويم / economic calendar"),
+    types.BotCommand("stats", "دقة البوت / accuracy"),
+    types.BotCommand("capital", "رأس المال / capital & risk"),
+    types.BotCommand("alert", "تنبيه سعري / price alert"),
+    types.BotCommand("alerts", "قائمة التنبيهات / list alerts"),
+    types.BotCommand("signals", "إشارات السوق / market signals"),
+    types.BotCommand("newsalerts", "تنبيهات الأخبار / news alerts"),
+    types.BotCommand("timezone", "المنطقة الزمنية / timezone"),
+    types.BotCommand("settings", "⚙️ ضبط البوت / bot settings"),
+]
+
+ADMIN_COMMANDS = NORMAL_COMMANDS + [
+    types.BotCommand("broadcast", "📢 إرسال جماعي / broadcast (admin)"),
+    types.BotCommand("users", "👥 المستخدمون / list users (admin)"),
+    types.BotCommand("reactivate", "♻️ إعادة تفعيل / reactivate (admin)"),
+]
+
+
+def register_global_command_menus():
+    """Set default menu for all private chats + override for each known admin."""
+    try:
+        bot.set_my_commands(NORMAL_COMMANDS, scope=types.BotCommandScopeAllPrivateChats())
+    except Exception:
+        logger.warning("could not set normal command menu", exc_info=True)
+        try:
+            bot.set_my_commands(NORMAL_COMMANDS)
+        except Exception:
+            logger.warning("fallback set_my_commands failed", exc_info=True)
+    # Admins from env get their personal menu immediately; role=admin users get it on /start
+    for admin_id in settings.admin_chat_ids:
+        try:
+            bot.set_my_commands(ADMIN_COMMANDS, scope=types.BotCommandScopeChat(chat_id=admin_id))
+        except Exception:
+            logger.warning("could not set admin menu for %s", admin_id, exc_info=True)
+
+
+def set_personal_menu(chat_id: int):
+    """Ensure this chat sees the right menu (admin vs normal). Called on /start."""
+    try:
+        if is_admin_chat(chat_id):
+            bot.set_my_commands(ADMIN_COMMANDS, scope=types.BotCommandScopeChat(chat_id=chat_id))
+        else:
+            # Clearing a chat-scoped menu makes Telegram fall back to AllPrivateChats
+            # but we set it explicitly to be safe.
+            bot.set_my_commands(NORMAL_COMMANDS, scope=types.BotCommandScopeChat(chat_id=chat_id))
+    except Exception:
+        logger.debug("personal menu set failed for %s", chat_id, exc_info=True)
+
+
 AR = {
     "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، سعر البيتكوين، ثنائي EURUSD، باك تست الذهب، ما أخبار التقويم اليوم؟ أو كم دقتك؟ الأوامر: /price و /assets و /binary و /backtest (اختبار الماضي) و /calendar و /stats و /capital و /analyze و /smc و /decision و /alert و /risk.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
-    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /settings /paperbuy /papersell /broadcast /users",
 }
 
-EN = {
-    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /settings /paperbuy /papersell /broadcast /users",
-}
+EN = {}
 
 
 def unknown_asset_text(lang: str) -> str:
@@ -467,14 +526,19 @@ def send_localized(chat_id: int, lang: str, ar: str, en: str):
 @bot.message_handler(commands=["start", "help"])
 def start_cmd(message: types.Message):
     remember_user(message)
+    set_personal_menu(message.chat.id)
     # The smart-money buttons are part of the entry point so the two ways of
     # driving the system (typed commands and taps) are discoverable together.
     language = user_language(message)
     remembered = db.get_user(message.chat.id)
     quick_asset = remembered.last_asset if remembered and remembered.last_asset else "BTC"
-    bot.reply_to(message, AR["start"] if language == "ar" else (
+    if is_admin_chat(message.chat.id):
+        welcome_extra = "\n\n👑 أنت مشرف — قائمة الأوامر عندك فيها /broadcast و /users و /reactivate" if language == "ar" else "\n\n👑 You are admin — your menu includes /broadcast, /users, /reactivate"
+    else:
+        welcome_extra = ""
+    bot.reply_to(message, (AR["start"] + welcome_extra) if language == "ar" else (
         "Welcome. Use /analyze BTC, /smc BTC (multi-timeframe smart-money report with buttons), "
-        "/alert below BTC 60000, /risk, and /paperbuy for paper trading."),
+        "/alert below BTC 60000, /risk, and /paperbuy for paper trading." + welcome_extra),
         reply_markup=smc_keyboard(quick_asset, language, "full"))
 
 
@@ -2030,9 +2094,16 @@ def run_broadcast_command(message: types.Message, text: str, photo=None):
 def text_cmd(message: types.Message):
     text = (message.text or "").strip()
     if text.startswith("/"):
-        # Never swallow an unknown command silently; say it was not handled.
+        # Never swallow an unknown command silently; show menu based on role
         lang = user_language(message)
-        bot.reply_to(message, AR["unknown_command"] if lang == "ar" else EN["unknown_command"])
+        remember_user(message)
+        is_admin = is_admin_chat(message.chat.id)
+        cmds = ADMIN_COMMANDS if is_admin else NORMAL_COMMANDS
+        cmd_list = " ".join(f"/{c.command}" for c in cmds)
+        if lang == "ar":
+            bot.reply_to(message, f"لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء.\nالأوامر المتاحة لك: {cmd_list}\n\n💡 اضغط زر القائمة ☰ بجانب الكتابة لتراها كلها.")
+        else:
+            bot.reply_to(message, f"There is no such command, so nothing was executed.\nYour available commands: {cmd_list}\n\n💡 Tap Menu ☰ next to the input to see them all.")
         return
     user = db.get_user(message.chat.id)
     request = parse_request(text, user.last_asset if user else None)
@@ -2964,35 +3035,7 @@ def main():
         bot.remove_webhook()
     except Exception:
         logger.warning("could not remove old webhook", exc_info=True)
-    try:
-        bot.set_my_commands([
-            types.BotCommand("start", "البداية والأزرار / start and buttons"),
-            types.BotCommand("price", "سعر لحظي / live price"),
-            types.BotCommand("assets", "كتالوج الأصول / asset catalog"),
-            types.BotCommand("binary", "تداول ثنائي CALL/PUT / binary verdict"),
-            types.BotCommand("backtest", "اختبار الاستراتيجية على الماضي / backtest"),
-            types.BotCommand("calendar", "التقويم الاقتصادي / economic calendar"),
-            types.BotCommand("stats", "دقة البوت / bot accuracy"),
-            types.BotCommand("capital", "رأس المال والمخاطرة / capital and risk"),
-            types.BotCommand("decision", "قرار صارم شراء/بيع/انتظار / strict verdict"),
-            types.BotCommand("smc", "تحليل سيولة ذكية 4H/1H/15m / smart-money report"),
-            types.BotCommand("analyze", "تحليل المؤشرات / indicator analysis"),
-            types.BotCommand("chart", "شارت من بيانات حقيقية / real-data chart"),
-            types.BotCommand("risk", "حساب المخاطرة / position sizing"),
-            types.BotCommand("alert", "تنبيه سعري / price alert"),
-            types.BotCommand("alerts", "قائمة التنبيهات / list alerts"),
-            types.BotCommand("cancel_alert", "إلغاء تنبيه / cancel alert"),
-            types.BotCommand("signals", "إشارات السوق / market signals"),
-            types.BotCommand("newsalerts", "تنبيهات الأخبار / news alerts"),
-            types.BotCommand("timezone", "المنطقة الزمنية / timezone"),
-            types.BotCommand("settings", "ضبط البوت / bot settings"),
-            types.BotCommand("paperbuy", "شراء ورقي / paper buy"),
-            types.BotCommand("papersell", "بيع ورقي / paper sell"),
-            types.BotCommand("broadcast", "إرسال جماعي / broadcast (admin)"),
-            types.BotCommand("users", "قائمة المستخدمين / list users (admin)"),
-        ])
-    except Exception:
-        logger.warning("could not register the Telegram command menu", exc_info=True)
+    register_global_command_menus()
     logger.info("MarketObserver Pro started in %s mode", "paper" if settings.paper_trading else "live-disabled")
     while True:
         try:
