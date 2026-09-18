@@ -240,10 +240,11 @@ class Database:
         with self.session() as s:
             user = s.scalar(select(User).where(User.chat_id == chat_id))
             if user is None:
-                user = User(chat_id=chat_id, username=username, language=language, last_asset=last_asset or "BTC")
+                user = User(chat_id=chat_id, username=username, language=language, last_asset=last_asset or "BTC", is_active=True)
                 s.add(user)
             else:
                 user.username = username
+                user.is_active = True  # re-activate on any interaction (unblocked / /start)
                 # A language chosen in ⚙️ settings beats per-message detection.
                 if user.lang_explicit is not True:
                     user.language = language

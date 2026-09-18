@@ -51,6 +51,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("marketobserver")
 
 settings = Settings.from_env()
+if settings.database_url.startswith("sqlite"):
+    logger.warning("DATABASE_URL is SQLite (%s) — on Render's ephemeral filesystem users are lost on each deploy. Use PostgreSQL for production.", settings.database_url)
 db = Database(settings.database_url)
 db.create_all()
 migrated_news_users = db.migrate_news_subscriptions()
@@ -74,11 +76,11 @@ app = Flask(__name__)
 AR = {
     "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، سعر البيتكوين، ثنائي EURUSD، باك تست الذهب، ما أخبار التقويم اليوم؟ أو كم دقتك؟ الأوامر: /price و /assets و /binary و /backtest (اختبار الماضي) و /calendar و /stats و /capital و /analyze و /smc و /decision و /alert و /risk.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
-    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /settings /paperbuy /papersell /broadcast",
+    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /settings /paperbuy /papersell /broadcast /users",
 }
 
 EN = {
-    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /settings /paperbuy /papersell /broadcast",
+    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /settings /paperbuy /papersell /broadcast /users",
 }
 
 
@@ -1027,7 +1029,7 @@ def smc_build_report(asset: Asset, force: bool = False):
 
 def smc_keyboard(asset_key: str, lang: str, mode: str) -> types.InlineKeyboardMarkup:
     """Inline buttons: pick asset, switch language, switch detail, refresh,
-    chart, zone alerts and the measurement rules. Every button carries the
+    chart and zone alerts. Every button carries the
     current asset/lang/mode so pressing one never loses context."""
     mode = mode if mode in SMC_MODES else "full"
     keyboard = types.InlineKeyboardMarkup(row_width=3)
@@ -1055,35 +1057,10 @@ def smc_keyboard(asset_key: str, lang: str, mode: str) -> types.InlineKeyboardMa
         types.InlineKeyboardButton("📊 شارت موسوم" if lang == "ar" else "📊 Annotated chart", callback_data=f"smc:chart:{asset_key}:{lang}:{mode}"),
         types.InlineKeyboardButton("🔔 راقب المنطقة" if lang == "ar" else "🔔 Watch zone", callback_data=f"smc:alert:{asset_key}:{lang}:{mode}"),
     )
-    keyboard.add(types.InlineKeyboardButton("🧮 كيف قِستُ (BOS/CHoCH/OB/FVG)" if lang == "ar" else "🧮 How it is measured",
-                                            callback_data=f"smc:rules:{asset_key}:{lang}:{mode}"))
+    keyboard.add(
+        types.InlineKeyboardButton("⚙️ الضبط" if lang == "ar" else "⚙️ Settings", callback_data=f"bin:settings:{asset_key}:{lang}:0"),
+    )
     return keyboard
-
-
-SMC_RULES_AR = (
-    "كيف تُكتَب النتائج (كل شيء حسابي، لا LLM):\n"
-    "• الهيكل: نقاط ارتكاز Fractal بنافذة شمعتين على كل جانب؛ الوسم لا يُعتمد إلا بعد إقفال الشمعتين التاليتين — لا استخدام لمستقبل البيانات.\n"
-    "• BOS: إغلاق جسم شمعة فوق آخر قمة مرتكز (للشراء) أو تحت آخر قاع (للبيع) مع كون الاتجاه على 4H في نفس الجهة.\n"
-    "• CHoCH: أول إغلاق معاكس للاتجاه السائد؛ يُستخدم كإنذار مبكر للانعكاس وليس كدخول.\n"
-    "• صيد السيولة: ذيل يخترق القمة/القاع ثم يعود الإغلاق للداخل — لا يُعامل ككسر أبدًا.\n"
-    "• OB: آخر شمعة معاكسة قبل حركة الإزاحة التي صنعت الكسر، وتبقى صالحة حتى إغلاق خلفها.\n"
-    "• FVG: فجوة ثلاث شموع بعرض ≥ 0.30 ATR؛ تُحسب نسبة التعبئة ولا تُقبل منطقة مُلأت ≥ 60%.\n"
-    "• الشموع: مطرقة/مقلوبتها/نجمة ساقطة = ذيل ≥ ضعفي الجسم؛ ابتلاعي = جسم يغلق فوق/تحت جسم السابقة مع كبره؛ نجمة صباح/مساء = ثلاث شموع بشروط وسطى صارمة؛ دوجي = جسم ≤ 10% من المدى. كل نمط يُذكر مع موضعه من المنطقة، لا منفردًا.\n"
-    "• الحجم: RVOL وارتفاعات ≥ 2.2x ونسبة الشراء العدواني من Binance (taker buy) وشكل OBV.\n"
-    "• القرار: كل البوابات (اتجاه 4H + تأكيد 15m + السعر داخل المنطقة + عدم المطاردة + إشارة شمعة + حجم + RR ≥ 1:2) يجب أن تنجح؛ وإلا WAIT."
-)
-SMC_RULES_EN = (
-    "How the numbers are produced (all arithmetic, no LLM):\n"
-    "• Structure: fractal pivots, 2 candles on each side; a pivot only counts after those two candles close — no look-ahead.\n"
-    "• BOS: a candle *body* closes above the last swing high (long) or below the last swing low (short) while the 4H bias agrees.\n"
-    "• CHoCH: first close against the prevailing bias — an early warning, not an entry.\n"
-    "• Liquidity sweep: a wick through the level with the close back inside — never counted as a break.\n"
-    "• OB: last opposing candle before the displacement leg that broke structure; valid until a close passes it.\n"
-    "• FVG: 3-candle gap at least 0.30 ATR wide; gaps filled ≥ 60% are rejected.\n"
-    "• Candles: hammer/inverted/shooting star need a wick ≥ 2x body; engulfing must close beyond the prior body; stars use strict three-candle rules; doji body ≤ 10% of range. Each print is reported with its location, never standalone.\n"
-    "• Volume: RVOL, spikes ≥ 2.2x, Binance taker buy share, OBV shape.\n"
-    "• Decision: every gate (4H trend, 15m confirmation, price in zone, no chasing, candle trigger, volume, RR ≥ 1:2) must pass — otherwise WAIT."
-)
 
 
 def deliver_smc(chat_id: int, text: str, markup=None, edit_message_id: int | None = None) -> None:
@@ -1214,10 +1191,6 @@ def smc_callback(call: types.CallbackQuery):
             smc_respond(call.message, asset, lang, mode)
             bot.answer_callback_query(call.id)
             return
-        if action == "rules":
-            deliver_smc(call.message.chat.id, SMC_RULES_AR if lang == "ar" else SMC_RULES_EN, smc_keyboard(asset.key, lang, mode))
-            bot.answer_callback_query(call.id)
-            return
         if action == "chart":
             report, candles = smc_build_report(asset, force=force)
             bot.send_chat_action(call.message.chat.id, "upload_photo")
@@ -1314,6 +1287,10 @@ def decision_keyboard(asset_key: str, lang: str, verbose: bool = False) -> types
         types.InlineKeyboardButton("🇸🇦 عربي", callback_data=f"dec:run:{asset_key}:ar:0:0"),
         types.InlineKeyboardButton("🇬🇧 English", callback_data=f"dec:run:{asset_key}:en:0:0"),
         types.InlineKeyboardButton("🌐 AR + EN", callback_data=f"dec:run:{asset_key}:both:0:0"),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton("⚙️ الضبط" if lang == "ar" else "⚙️ Settings",
+                                   callback_data=f"bin:settings:{asset_key}:{lang}:0"),
     )
     quick = [key for key in SMC_PRIMARY_ASSETS if key != asset_key][:4]
     keyboard.add(*[types.InlineKeyboardButton(SMC_BUTTON_NAMES.get(key, key),
@@ -1941,6 +1918,71 @@ def broadcast_photo(photo, caption: str, chat_ids: list[int] | None = None, dela
             time.sleep(delay)
     logger.info("photo broadcast finished: delivered %s of %s, failed %s, deactivated %s", sent, len(chat_ids), failed, deactivated)
     return {"users": len(chat_ids), "sent": sent, "failed": failed, "deactivated": deactivated}
+
+
+@bot.message_handler(commands=["users"])
+def users_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    if not is_admin_chat(message.chat.id):
+        bot.reply_to(message, "هذا الأمر مخصص للمشرفين فقط." if lang == "ar" else "This command is restricted to admins.")
+        return
+    stats = db.stats()
+    all_users = db.list_users(limit=200)
+    active = [u for u in all_users if u.is_active]
+    inactive = [u for u in all_users if not u.is_active]
+    if lang == "ar":
+        lines = [
+            f"👥 إجمالي المستخدمين: {stats['users']} | نشط: {stats['active_users']} | غير نشط: {len(inactive)}",
+            f"🔔 تنبيهات نشطة: {stats['active_alerts']} | سجل القرارات: {stats['journal_pending']} معلق / {stats['journal_resolved']} محلول",
+            "",
+            "— النشطون (يصلهم /broadcast):",
+        ]
+        for u in active[:30]:
+            lines.append(f"• {u.chat_id} @{u.username or '-'} | {u.language} | آخر أصل {u.last_asset} | {u.created_at.date() if u.created_at else ''}")
+        if inactive:
+            lines.append("")
+            lines.append("— غير النشطين (لا يصلهم البث — اطلب منهم /start أو استخدم /reactivate):")
+            for u in inactive[:30]:
+                lines.append(f"• {u.chat_id} @{u.username or '-'} | معطل")
+        lines.append("")
+        lines.append("💡 لإعادة تفعيل الجميع: /reactivate — ولرؤية قاعدة البيانات: /admin/users عبر API")
+    else:
+        lines = [
+            f"👥 Users: {stats['users']} total | {stats['active_users']} active | {len(inactive)} inactive",
+            f"🔔 Active alerts: {stats['active_alerts']} | journal: {stats['journal_pending']} pending / {stats['journal_resolved']} resolved",
+            "",
+            "— Active (receive /broadcast):",
+        ]
+        for u in active[:30]:
+            lines.append(f"• {u.chat_id} @{u.username or '-'} | {u.language} | last {u.last_asset}")
+        if inactive:
+            lines.append("")
+            lines.append("— Inactive (blocked / not receiving):")
+            for u in inactive[:30]:
+                lines.append(f"• {u.chat_id} inactive")
+        lines.append("")
+        lines.append("💡 To reactivate all: /reactivate")
+    for chunk in split_broadcast_text("\n".join(lines)):
+        bot.reply_to(message, chunk)
+
+
+@bot.message_handler(commands=["reactivate"])
+def reactivate_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    if not is_admin_chat(message.chat.id):
+        bot.reply_to(message, "هذا الأمر مخصص للمشرفين فقط." if lang == "ar" else "This command is restricted to admins.")
+        return
+    all_users = db.list_users(limit=500)
+    reactivated = 0
+    for u in all_users:
+        if not u.is_active:
+            if db.set_user_active(u.chat_id, True):
+                reactivated += 1
+    bot.reply_to(message,
+                 f"✅ تمت إعادة تفعيل {reactivated} مستخدم. الآن {db.count_active_users()} نشط." if lang == "ar"
+                 else f"✅ Reactivated {reactivated} users. Now {db.count_active_users()} active.")
 
 
 @bot.message_handler(commands=["broadcast"])
@@ -2943,8 +2985,11 @@ def main():
             types.BotCommand("signals", "إشارات السوق / market signals"),
             types.BotCommand("newsalerts", "تنبيهات الأخبار / news alerts"),
             types.BotCommand("timezone", "المنطقة الزمنية / timezone"),
+            types.BotCommand("settings", "ضبط البوت / bot settings"),
             types.BotCommand("paperbuy", "شراء ورقي / paper buy"),
             types.BotCommand("papersell", "بيع ورقي / paper sell"),
+            types.BotCommand("broadcast", "إرسال جماعي / broadcast (admin)"),
+            types.BotCommand("users", "قائمة المستخدمين / list users (admin)"),
         ])
     except Exception:
         logger.warning("could not register the Telegram command menu", exc_info=True)
