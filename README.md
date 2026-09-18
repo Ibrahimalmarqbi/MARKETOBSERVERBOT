@@ -161,14 +161,15 @@ pytest test
 
 ### قائمة الأوامر الذكية (ديناميكية حسب الدور)
 
-زر **القائمة ☰** بجانب حقل الكتابة يعرض أوامر مختلفة حسب دورك:
+زر **القائمة ☰** بجانب حقل الكتابة يعرض أوامر مختلفة حسب دورك لتقليل التشتيت:
 
-- **المستخدم العادي (16 أمرًا):** `/start /price /assets /binary /smc /decision /backtest /calendar /stats /capital /alert /alerts /signals /newsalerts /timezone /settings`
-- **المشرف (19 أمرًا):** كل أوامر العادي + `/broadcast /users /reactivate`
+- **المستخدم العادي (10 أوامر أساسية):** `/start /price /assets /binary /smc /decision /capital /alert /alerts /settings`
+  - الأوامر المتقدمة `/backtest /calendar /stats /signals /newsalerts /timezone` لا تزال تعمل عند كتابتها أو عبر الأزرار، لكنها مخفية من زر القائمة لتجنب الإرباك (رأيك: الباك تست ودقة البوت مالها داعي للمبتدئ)
+- **المشرف (20 أمر):** كل الأساسي + المتقدم + `/broadcast /broadcast_photo /users /reactivate`
 
 تُطبَّق عبر Telegram Bot API:
-- `BotCommandScopeAllPrivateChats` = القائمة الافتراضية للجميع (العادي)
-- `BotCommandScopeChat(chat_id)` = قائمة شخصية لكل مشرف معروف من `ADMIN_CHAT_IDS` أو `role=admin`
+- `BotCommandScopeAllPrivateChats` = القائمة الافتراضية للجميع (العادي = 10)
+- `BotCommandScopeChat(chat_id)` = قائمة شخصية لكل مشرف معروف من `ADMIN_CHAT_IDS` أو `role=admin` (20)
 
 عند `/start` يُستدعى `set_personal_menu(chat_id)` ليضمن أن كل مستخدم يرى قائمته الصحيحة فورًا، ويرى المشرف ملاحظة 👑 «أنت مشرف». الأوامر غير المعروفة التي تبدأ بـ `/` تُرد الآن بقائمة مخصصة حسب دورك بدل تجاهلها بصمت، مع تلميح لزر القائمة.
 

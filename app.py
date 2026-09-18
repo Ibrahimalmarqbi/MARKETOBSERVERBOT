@@ -74,30 +74,36 @@ app = Flask(__name__)
 
 
 # ---------------- Telegram command menus (normal vs admin) ---------------- #
-# Normal users see only trading/analysis commands; admins see broadcast tools too.
-# Telegram lets us set a menu per chat (BotCommandScopeChat) and a default for
-# everyone else (BotCommandScopeAllPrivateChats). This is how you never forget
-# a command name: tap Menu → pick.
-NORMAL_COMMANDS = [
+# Normal users see only the essential 10 commands to avoid confusion;
+# advanced commands (backtest, calendar, stats...) still work when typed
+# or via inline buttons, but are hidden from the Menu button.
+# Admins see everything.
+CORE_COMMANDS = [
     types.BotCommand("start", "البداية والأزرار / start and buttons"),
     types.BotCommand("price", "سعر لحظي / live price"),
     types.BotCommand("assets", "كتالوج الأصول / asset catalog"),
     types.BotCommand("binary", "تداول ثنائي CALL/PUT / binary verdict"),
     types.BotCommand("smc", "سيولة ذكية 4H/1H/15m / smart-money"),
     types.BotCommand("decision", "قرار صارم / strict verdict"),
-    types.BotCommand("backtest", "اختبار الماضي / backtest"),
-    types.BotCommand("calendar", "التقويم / economic calendar"),
-    types.BotCommand("stats", "دقة البوت / accuracy"),
     types.BotCommand("capital", "رأس المال / capital & risk"),
     types.BotCommand("alert", "تنبيه سعري / price alert"),
     types.BotCommand("alerts", "قائمة التنبيهات / list alerts"),
-    types.BotCommand("signals", "إشارات السوق / market signals"),
-    types.BotCommand("newsalerts", "تنبيهات الأخبار / news alerts"),
-    types.BotCommand("timezone", "المنطقة الزمنية / timezone"),
     types.BotCommand("settings", "⚙️ ضبط البوت / bot settings"),
 ]
 
-ADMIN_COMMANDS = NORMAL_COMMANDS + [
+ADVANCED_COMMANDS = [
+    types.BotCommand("backtest", "اختبار الماضي / backtest"),
+    types.BotCommand("calendar", "التقويم / economic calendar"),
+    types.BotCommand("stats", "دقة البوت / accuracy"),
+    types.BotCommand("signals", "إشارات السوق / market signals"),
+    types.BotCommand("newsalerts", "تنبيهات الأخبار / news alerts"),
+    types.BotCommand("timezone", "المنطقة الزمنية / timezone"),
+]
+
+# Normal user menu = core only (minimal, non-confusing)
+NORMAL_COMMANDS = CORE_COMMANDS
+
+ADMIN_COMMANDS = CORE_COMMANDS + ADVANCED_COMMANDS + [
     types.BotCommand("broadcast", "📢 إرسال جماعي / broadcast (admin)"),
     types.BotCommand("broadcast_photo", "🖼️ إرسال صورة جماعية / broadcast photo (admin)"),
     types.BotCommand("users", "👥 المستخدمون / list users (admin)"),
