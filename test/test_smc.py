@@ -422,9 +422,11 @@ def test_keyboard_carries_state_and_stays_inside_telegram_limits():
     for row in rows:
         for button in row:
             assert len(button.callback_data.encode("utf-8")) <= 64
-            assert button.callback_data.startswith("smc:")
+            # smc: for smart-money actions, bin: for global settings entry point
+            assert button.callback_data.startswith(("smc:", "bin:", "set:"))
     assert any("🔔" in button.text for row in rows for button in row)
     assert any("🌐" in button.text for row in rows for button in row)
+    assert any("⚙️" in button.text for row in rows for button in row)
 
 
 def test_http_endpoint_serves_the_same_analysis(tmp_path, monkeypatch):

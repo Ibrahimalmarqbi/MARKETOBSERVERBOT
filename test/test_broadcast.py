@@ -168,8 +168,15 @@ def test_unknown_command_is_answered_not_ignored(monkeypatch):
     replies = []
     monkeypatch.setattr(app.bot, "reply_to", lambda message, text, **kwargs: replies.append(text))
 
+    # normal user must see normal menu only, not admin commands
     app.text_cmd(Message("/nonexistent", chat_id=555))
+    assert replies and "/start" in replies[0]
+    assert "/broadcast" not in replies[0]
 
+    replies.clear()
+    # admin via ADMIN_CHAT_IDS sees admin commands in unknown-command help
+    monkeypatch.setattr(app, "settings", replace(app.settings, admin_chat_ids=(555,)))
+    app.text_cmd(Message("/nonexistent", chat_id=555))
     assert replies and "/broadcast" in replies[0]
 
 
