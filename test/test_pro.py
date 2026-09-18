@@ -403,11 +403,17 @@ def test_binary_keyboard_exposes_refresh_compare_and_settings():
         assert any(item == f"bin:run:EURUSD:{lang}:1" for item in data)          # refresh
         assert any(item.startswith(f"bin:compare:EURUSD:{lang}") for item in data)
         assert any(item.startswith(f"bin:settings:EURUSD:{lang}") for item in data)
-        settings_data = _keyboard_data(app.binary_settings_keyboard("EURUSD", lang))
+        # The ⚙️ button now opens the GLOBAL settings panel.
+        settings_data = _keyboard_data(app.settings_keyboard(4242, lang, "EURUSD"))
         assert f"set:mode:EURUSD:{lang}:strict" in settings_data
         assert f"set:mode:EURUSD:{lang}:scored" in settings_data
         assert f"set:lang:EURUSD:ar:0" in settings_data
+        assert f"set:news:EURUSD:{lang}:0" in settings_data
+        assert f"set:signals:EURUSD:{lang}:0" in settings_data
+        assert f"set:calendar:EURUSD:{lang}:0" in settings_data
         assert f"set:back:EURUSD:{lang}:0" in settings_data
+        # Opened from /settings (no asset) there is no back button.
+        assert f"set:back:EURUSD:{lang}:0" not in _keyboard_data(app.settings_keyboard(4242, lang, ""))
 
 
 def callback_update(data, chat_id=4242, message_id=8):
@@ -458,3 +464,86 @@ def test_settings_mode_toggle_persists_and_applies(telegram, monkeypatch):
         assert seen_modes[-1] == "scored"
     finally:
         app.db.set_binary_mode(4242, None)
+
+
+def test_settings_command_renders_the_full_panel(telegram):
+    app.db.upsert_user(4242, None, "ar")
+    # Deterministic risk context for the assertion; restore afterwards because
+    # the calendar suite reads capital/risk for its theoretical lot sizing.
+    saved_capital = app.db.get_user(4242).capital
+    saved_risk = app.db.get_user(4242).risk_percent
+    app.db.set_capital(4242, 1000.0)
+    app.db.set_risk_percent(4242, 1.0)
+    try:
+        SENT.clear()
+        app.bot.process_new_updates([message_update("/settings")])
+        panel = SENT[-1]
+        assert "⚙️ ضبط البوت" in panel
+        # All four sections are present.
+        assert "🌐 عام" in panel and "🎯 التداول الثنائي" in panel
+        assert "🔔 التنبيهات" in panel and "💰 المخاطرة" in panel
+        # Current state is shown, including the risk context.
+        assert "رأس المال" in panel and "المخاطرة: 1%" in panel
+    finally:
+        app.db.set_capital(4242, saved_capital)
+        app.db.set_risk_percent(4242, saved_risk)
+
+
+def test_settings_alert_toggles_persist(telegram):
+    app.db.upsert_user(4242, None, "ar")
+    user = app.db.get_user(4242)
+    saved = (user.news_enabled, user.signals_enabled, user.calendar_enabled)
+    # Start from the fresh-user defaults so the asserts are deterministic no
+    # matter what earlier tests left on the shared 4242 row; restore after.
+    app.db.set_news_enabled(4242, True)
+    app.db.set_signals_enabled(4242, False)
+    app.db.set_calendar_enabled(4242, True)
+    try:
+        SENT.clear()
+        app.bot.process_new_updates([message_update("/settings")])
+        assert SENT and "⚙️ ضبط البوت" in SENT[-1]
+        # News is on -> toggle turns it off, then on.
+        SENT.clear()
+        app.bot.process_new_updates([callback_update("set:news::ar:0")])
+        assert app.db.get_user(4242).news_enabled is False and "تم إيقافها" in SENT[-1]
+        SENT.clear()
+        app.bot.process_new_updates([callback_update("set:news::ar:0")])
+        assert app.db.get_user(4242).news_enabled is True and "تم تفعيلها" in SENT[-1]
+        # Signals start off -> on, calendar starts on -> off.
+        SENT.clear()
+        app.bot.process_new_updates([callback_update("set:signals::ar:0")])
+        assert app.db.get_user(4242).signals_enabled is True
+        SENT.clear()
+        app.bot.process_new_updates([callback_update("set:calendar::ar:0")])
+        assert app.db.get_user(4242).calendar_enabled is False
+    finally:
+        app.db.set_news_enabled(4242, saved[0])
+        app.db.set_signals_enabled(4242, saved[1])
+        app.db.set_calendar_enabled(4242, saved[2])
+
+
+def test_settings_language_persists_and_beats_detection(telegram):
+    # Dedicated chat id: the shared 4242 row is reused by other suites, and an
+    # explicit language choice on it would change their detected language.
+    app.db.upsert_user(9090, None, "en")
+    # Keep this row out of the calendar/news suites that broadcast to every
+    # subscribed user — its alerts would land after 4242's and shift SENT[-1].
+    app.db.set_calendar_enabled(9090, False)
+    app.db.set_news_enabled(9090, False)
+    SENT.clear()
+    app.bot.process_new_updates([callback_update("set:lang::ar:0", chat_id=9090)])
+    user = app.db.get_user(9090)
+    assert user.language == "ar" and user.lang_explicit is True
+    # The explicit choice now beats the client language for that account...
+    msg = message_update("show me btc", chat_id=9090, language="en").message
+    assert app.user_language(msg) == "ar"
+    # ...but Arabic typed in a message always wins, even against an explicit EN choice.
+    app.db.set_language(9090, "en")
+    msg_ar = message_update("اريني الذهب", chat_id=9090, language="en").message
+    assert app.user_language(msg_ar) == "ar"
+    # Routine message processing must not overwrite the explicit choice.
+    app.db.upsert_user(9090, None, "en")
+    assert app.db.get_user(9090).language == "en"
+    # A user without an explicit choice still follows per-message detection.
+    fresh = message_update("show me btc", chat_id=7777, language="en").message
+    assert app.user_language(fresh) == "en"

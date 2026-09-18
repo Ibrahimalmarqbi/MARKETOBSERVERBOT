@@ -55,6 +55,7 @@ class User(Base):
     capital: Mapped[float] = mapped_column(Float, default=1000.0)
     risk_percent: Mapped[float] = mapped_column(Float, default=1.0)
     binary_mode: Mapped[str | None] = mapped_column(String(10), nullable=True)  # strict | scored; None = global default
+    lang_explicit: Mapped[bool] = mapped_column(Boolean, default=False)  # language chosen in settings; detection must not overwrite it
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -206,6 +207,8 @@ class Database:
             missing.append("ALTER TABLE users ADD COLUMN risk_percent DOUBLE PRECISION DEFAULT 1.0")
         if "binary_mode" not in columns:
             missing.append("ALTER TABLE users ADD COLUMN binary_mode VARCHAR(10) NULL")
+        if "lang_explicit" not in columns:
+            missing.append("ALTER TABLE users ADD COLUMN lang_explicit BOOLEAN DEFAULT FALSE")
         if missing:
             with self.engine.begin() as connection:
                 for statement in missing:
@@ -219,6 +222,7 @@ class Database:
             connection.execute(text("UPDATE users SET calendar_enabled = TRUE WHERE calendar_enabled IS NULL"))
             connection.execute(text("UPDATE users SET capital = 1000.0 WHERE capital IS NULL OR capital <= 0"))
             connection.execute(text("UPDATE users SET risk_percent = 1.0 WHERE risk_percent IS NULL OR risk_percent <= 0"))
+            connection.execute(text("UPDATE users SET lang_explicit = FALSE WHERE lang_explicit IS NULL"))
 
     @contextmanager
     def session(self):
@@ -240,7 +244,9 @@ class Database:
                 s.add(user)
             else:
                 user.username = username
-                user.language = language
+                # A language chosen in ⚙️ settings beats per-message detection.
+                if user.lang_explicit is not True:
+                    user.language = language
                 if last_asset:
                     user.last_asset = last_asset
                 # Re-enroll legacy users automatically, but never override an
@@ -277,6 +283,14 @@ class Database:
         """Persist the user's binary entry mode. None = follow the global default."""
         with self.session() as s:
             s.execute(update(User).where(User.chat_id == chat_id).values(binary_mode=mode, updated_at=utcnow()))
+
+    def set_language(self, chat_id: int, lang: str) -> None:
+        """Persist an explicit language choice from the settings panel."""
+        if lang not in ("ar", "en"):
+            return
+        with self.session() as s:
+            s.execute(update(User).where(User.chat_id == chat_id)
+                      .values(language=lang, lang_explicit=True, updated_at=utcnow()))
 
     def set_calendar_enabled(self, chat_id: int, enabled: bool) -> None:
         with self.session() as s:

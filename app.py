@@ -74,11 +74,11 @@ app = Flask(__name__)
 AR = {
     "start": "أهلًا بك في MarketObserver Pro. اكتب مثلًا: حلل الذهب، سعر البيتكوين، ثنائي EURUSD، باك تست الذهب، ما أخبار التقويم اليوم؟ أو كم دقتك؟ الأوامر: /price و /assets و /binary و /backtest (اختبار الماضي) و /calendar و /stats و /capital و /analyze و /smc و /decision و /alert و /risk.",
     "data_error": "تعذر الحصول على بيانات سوق موثوقة لهذا الأصل حاليًا. لم يتم إنشاء بيانات بديلة ولن أعرض تحليلًا غير حقيقي. جرّب لاحقًا أو استخدم رمزًا من مزود بيانات آخر.",
-    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "لا يوجد أمر بهذا الاسم، لذلك لم يُنفَّذ أي شيء. الأوامر المتاحة: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /settings /paperbuy /papersell /broadcast",
 }
 
 EN = {
-    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /paperbuy /papersell /broadcast",
+    "unknown_command": "There is no such command, so nothing was executed. Available commands: /start /price /assets /binary /backtest /calendar /stats /capital /analyze /smc /decision /chart /risk /alert /alerts /cancel_alert /signals /newsalerts /timezone /settings /paperbuy /papersell /broadcast",
 }
 
 
@@ -217,11 +217,23 @@ def general_response(lang: str) -> str:
 
 
 def user_language(message: types.Message) -> str:
+    """Language resolution: Arabic typed in this message wins; then a language
+    the user explicitly chose in ⚙️ settings; then the client language; then
+    the English default. A merely-detected language (stored from an earlier
+    message) must not override the current message."""
     text = getattr(message, "text", "") or ""
     if re.search(r"[\u0600-\u06ff]", text):
         return "ar"
+    try:
+        user = db.get_user(getattr(message.chat, "id", None))
+        if user is not None and user.lang_explicit and user.language in {"ar", "en"}:
+            return user.language
+    except Exception:
+        pass
     code = getattr(getattr(message, "from_user", None), "language_code", "") or ""
-    return "ar" if code.lower().startswith("ar") else "en"
+    if code.lower().startswith("ar"):
+        return "ar"
+    return "en"
 
 
 def remember_user(message: types.Message, asset: Asset | None = None):
@@ -1486,71 +1498,114 @@ def binary_keyboard(asset_key: str, lang: str) -> types.InlineKeyboardMarkup:
     return keyboard
 
 
-def binary_settings_keyboard(asset_key: str, lang: str) -> types.InlineKeyboardMarkup:
+def settings_keyboard(chat_id: int, lang: str, asset_key: str = "") -> types.InlineKeyboardMarkup:
+    """⚙️ Global settings keyboard: binary entry mode, language, alert
+    toggles, and (only when opened from a binary report) a back button."""
     ar = lang == "ar"
+    key = asset_key or ""
+    user = None
+    try:
+        user = db.get_user(chat_id)
+    except Exception:
+        user = None
+    news_on = bool(user and user.news_enabled)
+    signals_on = bool(user and user.signals_enabled)
+    calendar_on = bool(user and user.calendar_enabled)
+    state = (lambda on: "مفعلة" if on else "متوقفة") if ar else (lambda on: "on" if on else "off")
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         types.InlineKeyboardButton("🔒 strict — إلزامي 8/8" if ar else "🔒 strict — all 8 gates",
-                                   callback_data=f"set:mode:{asset_key}:{lang}:strict"),
+                                   callback_data=f"set:mode:{key}:{lang}:strict"),
         types.InlineKeyboardButton("📊 scored — من 6/8" if ar else "📊 scored — from 6/8",
-                                   callback_data=f"set:mode:{asset_key}:{lang}:scored"),
+                                   callback_data=f"set:mode:{key}:{lang}:scored"),
     )
     keyboard.add(
-        types.InlineKeyboardButton("🇸🇦 عربي", callback_data=f"set:lang:{asset_key}:ar:0"),
-        types.InlineKeyboardButton("🇬🇧 EN", callback_data=f"set:lang:{asset_key}:en:0"),
+        types.InlineKeyboardButton("🇸🇦 عربي", callback_data=f"set:lang:{key}:ar:0"),
+        types.InlineKeyboardButton("🇬🇧 EN", callback_data=f"set:lang:{key}:en:0"),
     )
-    keyboard.add(types.InlineKeyboardButton("↩️ رجوع للتحليل" if ar else "↩️ Back to analysis",
-                                            callback_data=f"set:back:{asset_key}:{lang}:0"))
+    keyboard.add(
+        types.InlineKeyboardButton(f"📰 الأخبار: {state(news_on)}", callback_data=f"set:news:{key}:{lang}:0"),
+        types.InlineKeyboardButton(f"📡 المراقبة: {state(signals_on)}" if ar else f"📡 Signals: {state(signals_on)}",
+                                   callback_data=f"set:signals:{key}:{lang}:0"),
+        types.InlineKeyboardButton(f"📅 التقويم: {state(calendar_on)}" if ar else f"📅 Calendar: {state(calendar_on)}",
+                                   callback_data=f"set:calendar:{key}:{lang}:0"),
+    )
+    if asset_key:
+        keyboard.add(types.InlineKeyboardButton("↩️ رجوع للتحليل" if ar else "↩️ Back to analysis",
+                                                callback_data=f"set:back:{asset_key}:{lang}:0"))
     return keyboard
 
 
-def binary_settings_respond(target_message, asset: Asset, lang: str,
-                            notice: str | None = None,
-                            edit_message_id: int | None = None) -> None:
-    """⚙️ Settings panel: shows the effective /binary entry mode and language,
-    and lets the user persist their own entry mode for this account."""
+def settings_respond(target_message, asset: Asset | None, lang: str,
+                     notice: str | None = None,
+                     edit_message_id: int | None = None) -> None:
+    """⚙️ Whole-bot settings panel: language, /binary entry mode, alert
+    toggles and risk context. Everything persists on the user's account."""
     chat_id = target_message.chat.id
-    saved = None
+    ar = lang == "ar"
+    user = None
     try:
         user = db.get_user(chat_id)
-        if user is not None and user.binary_mode in {"strict", "scored"}:
-            saved = user.binary_mode
     except Exception:
         logger.exception("settings read failed for chat %s", chat_id)
-    effective = saved or BINARY_ENTRY_MODE
+    saved_mode = user.binary_mode if (user and user.binary_mode in {"strict", "scored"}) else None
+    effective_mode = saved_mode or BINARY_ENTRY_MODE
     mode_desc = {
-        "strict": "🔒 strict — كل البوابات الثمانية إلزامية (8/8)" if lang == "ar"
-                  else "🔒 strict — all eight gates required (8/8)",
-        "scored": "📊 scored — الدخول عند 6/8 فأكثر (بوابات السلامة الست + جودة البقيتين)" if lang == "ar"
-                  else "📊 scored — enter at 6/8 or above (6 safety gates + quality gates)",
-    }[effective]
-    if lang == "ar":
+        "strict": "كل البوابات الثمانية إلزامية (8/8)" if ar else "all eight gates required (8/8)",
+        "scored": "الدخول عند 6/8 فأكثر (بوابات السلامة الست + جودة البقيتين)" if ar
+                  else "enter at 6/8 or above (6 safety gates + quality gates)",
+    }[effective_mode]
+    state = (lambda on: "مفعلة" if on else "متوقفة") if ar else (lambda on: "on" if on else "off")
+    stored_lang = user.language if (user and user.language in {"ar", "en"}) else "ar"
+    header = f"⚙️ ضبط البوت" if ar else "⚙️ Bot settings"
+    if asset is not None:
+        header += f" — {asset.name_ar if ar else asset.name_en} ({asset.key})"
+    if ar:
         lines = [
-            f"⚙️ ضبط البوت — {asset.name_ar} ({asset.key})",
+            header,
             "",
-            "🎯 وضع دخول /binary:",
-            f"   الحالي: {effective} — ({'ضبطك الشخصي' if saved else 'الافتراضي العام'})",
-            f"   {mode_desc}",
+            "🌐 عام",
+            f"• اللغة: {'عربي' if stored_lang == 'ar' else 'English'}",
             "",
-            f"🌐 اللغة: {'عربي' if lang == 'ar' else 'English'}",
+            "🎯 التداول الثنائي",
+            f"• وضع الدخول: {effective_mode} — ({'ضبطك الشخصي' if saved_mode else 'الافتراضي العام'})",
+            f"  {mode_desc}",
+            "",
+            "🔔 التنبيهات",
+            f"• الأخبار: {state(bool(user and user.news_enabled))}",
+            f"• المراقبة التلقائية: {state(bool(user and user.signals_enabled))}",
+            f"• التقويم: {state(bool(user and user.calendar_enabled))}",
+            "",
+            "💰 المخاطرة",
+            f"• رأس المال: {user.capital:g} | المخاطرة: {user.risk_percent:g}% | منطقة الوقت: {user.tz_name}"
+            if user else "• رأس المال: 1000 | المخاطرة: 1% | منطقة الوقت: Asia/Riyadh",
+            "• للتغيير: /capital 2000 1 — /timezone Asia/Riyadh",
         ]
-        if notice:
-            lines += ["", notice]
-        lines += ["", "التغييرات تُحفظ على حسابك وتُطبَّق فورًا على القرارات والباك تست."]
     else:
         lines = [
-            f"⚙️ Bot settings — {asset.name_en} ({asset.key})",
+            header,
             "",
-            "🎯 /binary entry mode:",
-            f"   current: {effective} — ({'your personal setting' if saved else 'global default'})",
-            f"   {mode_desc}",
+            "🌐 General",
+            f"• Language: {'Arabic' if stored_lang == 'ar' else 'English'}",
             "",
-            "🌐 Language: English",
+            "🎯 Binary trading",
+            f"• Entry mode: {effective_mode} — ({'your personal setting' if saved_mode else 'global default'})",
+            f"  {mode_desc}",
+            "",
+            "🔔 Alerts",
+            f"• News: {state(bool(user and user.news_enabled))}",
+            f"• Signal watch: {state(bool(user and user.signals_enabled))}",
+            f"• Calendar: {state(bool(user and user.calendar_enabled))}",
+            "",
+            "💰 Risk",
+            f"• Capital: {user.capital:g} | risk: {user.risk_percent:g}% | timezone: {user.tz_name}"
+            if user else "• Capital: 1000 | risk: 1% | timezone: Asia/Riyadh",
+            "• To change: /capital 2000 1 — /timezone Asia/Riyadh",
         ]
-        if notice:
-            lines += ["", notice]
-        lines += ["", "Changes are saved to your account and apply to verdicts and backtests immediately."]
-    markup = binary_settings_keyboard(asset.key, lang)
+    if notice:
+        lines += ["", notice]
+    lines += ["", "التغييرات تُحفظ على حسابك وتُطبَّق فورًا." if ar else "Changes are saved to your account and apply immediately."]
+    markup = settings_keyboard(chat_id, lang, asset.key if asset else "")
     deliver_smc(chat_id, "\n".join(lines), markup, edit_message_id=edit_message_id)
 
 
@@ -1648,8 +1703,8 @@ def binary_callback(call: types.CallbackQuery):
     if action == "compare":
         compare_binary_respond(call.message, asset, lang)
     elif action == "settings":
-        binary_settings_respond(call.message, asset, lang,
-                                edit_message_id=call.message.message_id if call.message else None)
+        settings_respond(call.message, asset, lang,
+                         edit_message_id=call.message.message_id if call.message else None)
     else:  # run (default)
         binary_respond(call.message, asset, lang, force=force == "1",
                        edit_message_id=call.message.message_id if call.message else None)
@@ -1657,35 +1712,70 @@ def binary_callback(call: types.CallbackQuery):
 
 
 @bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("set:")))
-def binary_settings_callback(call: types.CallbackQuery):
-    """⚙️ Settings panel actions: persist entry mode, switch language, go back."""
+def settings_callback(call: types.CallbackQuery):
+    """⚙️ Global settings actions: language, binary entry mode, alert
+    toggles, and back to the analysis. Only 'back' needs a known asset;
+    the panel itself renders fine without one."""
     parts = (call.data or "").split(":")
     if len(parts) < 5:
         bot.answer_callback_query(call.id)
         return
     _, action, asset_key, slot, flag = parts[:5]
-    asset = ASSETS.get(asset_key) or resolve_asset(asset_key)
     chat_id = call.message.chat.id
-    if asset is None:
-        bot.answer_callback_query(call.id, "أصل غير معروف" if slot in ("ar", "en") else "Unknown asset", show_alert=True)
-        return
+    asset = (ASSETS.get(asset_key) or resolve_asset(asset_key)) if asset_key else None
     lang = slot if slot in ("ar", "en") else (smc_prefs.get(chat_id, {}) or {}).get("lang") or "ar"
     if lang not in ("ar", "en"):
         lang = "ar"
-    smc_prefs.setdefault(chat_id, {})["lang"] = lang
     edit_message_id = call.message.message_id if call.message else None
+    if action == "back":
+        if asset is None:
+            bot.answer_callback_query(call.id)
+            return
+        smc_prefs.setdefault(chat_id, {})["lang"] = lang
+        db.set_last_asset(chat_id, asset.key)
+        binary_respond(call.message, asset, lang, edit_message_id=edit_message_id)
+        bot.answer_callback_query(call.id)
+        return
     if action == "mode" and flag in ("strict", "scored"):
         db.set_binary_mode(chat_id, flag)
         notice = ("⚙️ تم الحفظ: وضع الدخول الآن " + flag if lang == "ar"
                   else "Saved: entry mode is now " + flag)
-        binary_settings_respond(call.message, asset, lang, notice=notice,
-                                edit_message_id=edit_message_id)
     elif action == "lang" and slot in ("ar", "en"):
-        binary_settings_respond(call.message, asset, slot, edit_message_id=edit_message_id)
-    elif action == "back":
-        db.set_last_asset(chat_id, asset.key)
-        binary_respond(call.message, asset, lang, edit_message_id=edit_message_id)
+        db.set_language(chat_id, slot)
+        lang = slot
+        notice = ("⚙️ تم الحفظ: اللغة الآن عربية" if slot == "ar"
+                  else "Saved: language is now English")
+    elif action == "news":
+        user = db.get_user(chat_id)
+        was_on = bool(user and user.news_enabled)
+        db.set_news_enabled(chat_id, not was_on)
+        notice = ("⚙️ الأخبار: " + ("تم إيقافها" if was_on else "تم تفعيلها") if lang == "ar"
+                  else "News alerts: " + ("disabled" if was_on else "enabled"))
+    elif action == "signals":
+        user = db.get_user(chat_id)
+        was_on = bool(user and user.signals_enabled)
+        db.set_signals_enabled(chat_id, not was_on)
+        notice = ("⚙️ المراقبة التلقائية: " + ("تم إيقافها" if was_on else "تم تفعيلها") if lang == "ar"
+                  else "Signal watch: " + ("disabled" if was_on else "enabled"))
+    elif action == "calendar":
+        user = db.get_user(chat_id)
+        was_on = bool(user and user.calendar_enabled)
+        db.set_calendar_enabled(chat_id, not was_on)
+        notice = ("⚙️ التقويم: " + ("تم إيقاف تنبيهاته" if was_on else "تم تفعيل تنبيهاته") if lang == "ar"
+                  else "Calendar: " + ("alerts disabled" if was_on else "alerts enabled"))
+    else:
+        bot.answer_callback_query(call.id)
+        return
+    smc_prefs.setdefault(chat_id, {})["lang"] = lang
+    settings_respond(call.message, asset, lang, notice=notice, edit_message_id=edit_message_id)
     bot.answer_callback_query(call.id)
+
+
+@bot.message_handler(commands=["settings"])
+def settings_cmd(message: types.Message):
+    lang = user_language(message)
+    remember_user(message)
+    settings_respond(message, None, lang)
 
 
 def smc_chart(asset: Asset, report, candles_by_timeframe: dict):
