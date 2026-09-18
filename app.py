@@ -99,6 +99,7 @@ NORMAL_COMMANDS = [
 
 ADMIN_COMMANDS = NORMAL_COMMANDS + [
     types.BotCommand("broadcast", "📢 إرسال جماعي / broadcast (admin)"),
+    types.BotCommand("broadcast_photo", "🖼️ إرسال صورة جماعية / broadcast photo (admin)"),
     types.BotCommand("users", "👥 المستخدمون / list users (admin)"),
     types.BotCommand("reactivate", "♻️ إعادة تفعيل / reactivate (admin)"),
 ]
